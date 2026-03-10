@@ -20,7 +20,6 @@ const area_auto_fallback = document.querySelector('#area_auto_fallback');
 const keyword_exclude = document.querySelector('#keyword_exclude');
 
 // advance
-const browser = document.querySelector('#browser');
 const play_ticket_sound = document.querySelector('#play_ticket_sound');
 const play_order_sound = document.querySelector('#play_order_sound');
 const play_sound_filename = document.querySelector('#play_sound_filename');
@@ -204,7 +203,6 @@ function load_settins_to_form(settings)
         keyword_exclude.value = format_keyword_for_display(settings.keyword_exclude);
         
         // advanced
-        browser.value = settings.browser;
 
         play_ticket_sound.checked = settings.advanced.play_sound.ticket;
         play_order_sound.checked = settings.advanced.play_sound.order;
@@ -463,8 +461,6 @@ function save_changes_to_dict(silent_flag)
             settings.keyword_exclude = format_config_keyword_for_json(keyword_exclude.value);
 
             // advanced
-            settings.browser = browser.value;
-
             settings.advanced.play_sound.ticket = play_ticket_sound.checked;
             settings.advanced.play_sound.order = play_order_sound.checked;
             settings.advanced.play_sound.filename = play_sound_filename.value;
@@ -636,7 +632,7 @@ function maxbot_save()
 function check_unsaved_fields()
 {
     if(settings) {
-        const field_list_basic = ["homepage","ticket_number","refresh_datetime","browser"];
+        const field_list_basic = ["homepage","ticket_number","refresh_datetime"];
         field_list_basic.forEach(f => {
             const field = document.querySelector('#'+f);
             if(field.value != settings[f]) {
@@ -1228,6 +1224,87 @@ if (tixcraft_sid) {
         }
     });
 }
+
+// Help Panel — SVG icon injected from static constant (no user data)
+const HELP_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-info-circle" viewBox="0 0 16 16"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14m0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16"/><path d="m8.93 6.588-2.29.287-.082.38.45.083c.294.07.352.176.288.469l-.738 3.468c-.194.897.105 1.319.808 1.319.545 0 1.178-.252 1.465-.598l.088-.416c-.2.176-.492.246-.686.246-.275 0-.375-.193-.304-.533zM9 4.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0"/></svg>';
+// Safe: HELP_ICON_SVG is a static developer-authored SVG string, not user input
+document.querySelectorAll('.help-icon').forEach(function(el) { el.innerHTML = HELP_ICON_SVG; });
+let currentHelpField = null;
+let helpOffcanvasInstance = null;
+
+function getHelpOffcanvas() {
+    if (!helpOffcanvasInstance) {
+        const el = document.getElementById('helpPanel');
+        if (!el) return null;
+        helpOffcanvasInstance = new bootstrap.Offcanvas(el);
+        el.addEventListener('hide.bs.offcanvas', () => {
+            currentHelpField = null;
+        });
+    }
+    return helpOffcanvasInstance;
+}
+
+function buildHelpBody(content) {
+    let html = '<div class="mb-3">' + content.detail + '</div>';
+    if (content.faq && content.faq.length > 0) {
+        html += '<div class="accordion accordion-flush" id="helpFaqAccordion">';
+        content.faq.forEach(function(item, i) {
+            html += '<div class="accordion-item">'
+                + '<h2 class="accordion-header">'
+                + '<button class="accordion-button collapsed py-2" type="button"'
+                + ' data-bs-toggle="collapse" data-bs-target="#helpFaq' + i + '"'
+                + ' aria-expanded="false">' + item.q + '</button>'
+                + '</h2>'
+                + '<div id="helpFaq' + i + '" class="accordion-collapse collapse"'
+                + ' data-bs-parent="#helpFaqAccordion">'
+                + '<div class="accordion-body py-2">' + item.a + '</div>'
+                + '</div></div>';
+        });
+        html += '</div>';
+    }
+    return html;
+}
+
+function showHelp(fieldId) {
+    var content = (typeof HELP_CONTENT !== 'undefined') && HELP_CONTENT[fieldId];
+    if (!content) return;
+    if (currentHelpField === fieldId) return;
+
+    var oc = getHelpOffcanvas();
+    if (!oc) return;
+
+    currentHelpField = fieldId;
+    document.getElementById('helpPanelTitle').textContent = content.title;
+    // Safe: buildHelpBody returns static developer-authored HTML from help-content.js, no user input
+    document.getElementById('helpPanelBody').innerHTML = buildHelpBody(content);
+
+    var footer = document.getElementById('helpPanelFooter');
+    var link = document.getElementById('helpPanelLink');
+    if (content.link) {
+        link.href = content.link;
+        footer.style.display = '';
+    } else {
+        footer.style.display = 'none';
+    }
+
+    oc.show();
+}
+
+document.addEventListener('click', function(e) {
+    var icon = e.target.closest('.help-icon');
+    if (icon) {
+        e.preventDefault();
+        e.stopPropagation();
+        showHelp(icon.dataset.help);
+    }
+});
+
+document.addEventListener('keydown', function(e) {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.classList.contains('help-icon')) {
+        e.preventDefault();
+        showHelp(e.target.dataset.help);
+    }
+});
 
 // Clean up when page unloads
 window.addEventListener('beforeunload', () => {
