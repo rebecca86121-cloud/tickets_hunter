@@ -2699,6 +2699,14 @@ async def _nol_handle_gpo_captcha(tab, config_dict):
             except Exception:
                 pass
 
+        # Consensus boost: if multiple models agree on the same result, boost its score
+        result_counts = {}
+        for name, text, score in candidates:
+            result_counts[text] = result_counts.get(text, 0) + 1
+        for i, (name, text, score) in enumerate(candidates):
+            if result_counts[text] >= 2:
+                candidates[i] = (name, text, score + 5)  # consensus bonus
+
         # Sort by score, pick the best
         candidates.sort(key=lambda x: x[2], reverse=True)
         print(f"[NOL-GPO] OCR candidates: {[(c[0], c[1], c[2]) for c in candidates]}")
@@ -2708,7 +2716,8 @@ async def _nol_handle_gpo_captcha(tab, config_dict):
             return False
 
         ocr_answer = candidates[0][1]
-        print(f"[NOL-GPO] CAPTCHA OCR best: {ocr_answer} (from {candidates[0][0]})")
+        consensus = result_counts.get(ocr_answer, 0)
+        print(f"[NOL-GPO] CAPTCHA OCR best: {ocr_answer} (from {candidates[0][0]}, consensus={consensus})")
 
         if len(ocr_answer) < 3:
             print(f"[NOL-GPO] CAPTCHA answer too short ({ocr_answer})")
@@ -2956,7 +2965,7 @@ async def _nol_handle_gpo_captcha(tab, config_dict):
         except Exception as e:
             print(f"[NOL-GPO] JS function scan error: {e}")
 
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(0.8)
 
         # Check if CAPTCHA is still showing (wrong answer)
         # Use innerText keyword check — innerText excludes display:none elements,
@@ -3098,7 +3107,7 @@ async def _nol_handle_gpo_captcha(tab, config_dict):
                 ''')
                 print("[NOL-GPO] Clicked CAPTCHA image to refresh")
 
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
             return False
 
         print("[NOL-GPO] CAPTCHA appears solved!")
@@ -3153,7 +3162,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
     except Exception:
         pass
 
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.1)
 
     try:
         # Detect which step we're on by checking actual page elements
@@ -3713,7 +3722,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                 })()
             ''')
             print(f"[NOL-GPO] Time: {time_result}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
 
             # Click "Next" button (check main doc - buttons are usually in main frame)
             next_result = await tab.evaluate('''
@@ -3775,7 +3784,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
             print(f"[NOL-GPO] Next button: {next_result}")
 
             if 'clicked' in str(next_result) or 'called' in str(next_result):
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
                 play_sound_while_ordering(config_dict)
             return True
 
@@ -3864,7 +3873,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                             ''')
                             if not still_captcha:
                                 print(f"[NOL-GPO] ✅ CAPTCHA no longer present (page advanced), breaking out")
-                                await asyncio.sleep(1.0)
+                                await asyncio.sleep(0.2)
                                 play_sound_while_ordering(config_dict)
                                 break
 
@@ -3872,15 +3881,15 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                             captcha_solved = await _nol_handle_gpo_captcha(tab, config_dict)
                             if captcha_solved:
                                 print(f"[NOL-GPO] ✅ CAPTCHA solved on attempt {attempt + 1}!")
-                                await asyncio.sleep(1.0)
+                                await asyncio.sleep(0.2)
                                 play_sound_while_ordering(config_dict)
                                 break
                             else:
                                 print(f"[NOL-GPO] CAPTCHA attempt {attempt + 1}/15 failed")
-                                await asyncio.sleep(1.0)
+                                await asyncio.sleep(0.3)
                         except Exception as e:
                             print(f"[NOL-GPO] CAPTCHA error: {e}")
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.3)
                     else:
                         print("[NOL-GPO] ❌ CAPTCHA not solved after 15 attempts")
                         play_sound_while_ordering(config_dict)
@@ -4705,7 +4714,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
             print(f"[NOL-GPO] Price selection: {price_result}")
 
             if 'no_price_rows' not in str(price_result) and 'no_qty_set' not in str(price_result):
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
                 # Click Next (SmallNextBtnImage) — search main doc AND iframes
                 next_result = await tab.evaluate('''
                     (function() {
@@ -4746,7 +4755,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                     })()
                 ''')
                 print(f"[NOL-GPO] Price next: {next_result}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
                 play_sound_while_ordering(config_dict)
 
             return True
