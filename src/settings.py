@@ -162,6 +162,7 @@ def get_default_config():
     config_dict["accounts"]["ticket_account"] = ""
     config_dict["accounts"]["udn_account"] = ""
     config_dict["accounts"]["ticketplus_account"] = ""
+    config_dict["accounts"]["nol_account"] = ""
 
     config_dict["accounts"]["facebook_password"] = ""
     config_dict["accounts"]["kktix_password"] = ""
@@ -173,6 +174,7 @@ def get_default_config():
     config_dict["accounts"]["ticket_password"] = ""
     config_dict["accounts"]["udn_password"] = ""
     config_dict["accounts"]["ticketplus_password"] = ""
+    config_dict["accounts"]["nol_password"] = ""
 
     # Advanced settings (non-credential settings only)
     config_dict['advanced']={}
@@ -269,7 +271,7 @@ def migrate_config(config_dict):
 
     # Ensure all default fields exist (fills missing keys from new versions)
     default = get_default_config()
-    for section in ["advanced", "kktix", "tixcraft", "date_auto_select", "area_auto_select", "ocr_captcha", "contact", "accounts", "cityline"]:
+    for section in ["advanced", "kktix", "tixcraft", "date_auto_select", "area_auto_select", "ocr_captcha", "contact", "accounts", "cityline", "nol"]:
         if section in default:
             if section not in config_dict or not isinstance(config_dict[section], dict):
                 config_dict[section] = dict(default[section])

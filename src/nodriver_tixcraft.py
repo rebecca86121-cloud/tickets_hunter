@@ -52,6 +52,7 @@ from platforms.tixcraft import *
 from platforms.ibon import *
 from platforms.kham import *
 from platforms.hkticketing import *
+from platforms.nol import *
 
 CONST_CITYLINE_SIGN_IN_URL = "https://www.cityline.com/Login.html?targetUrl=https%3A%2F%2Fwww.cityline.com%2FEvents.html"
 CONST_FAMI_SIGN_IN_URL = "https://www.famiticket.com.tw/Home/User/SignIn"
@@ -62,6 +63,7 @@ CONST_KKTIX_SIGN_IN_URL = "https://kktix.com/users/sign_in?back_to=%s"
 CONST_TICKET_SIGN_IN_URL = "https://ticket.com.tw/application/utk13/utk1306_.aspx"
 CONST_UDN_SIGN_IN_URL = "https://tickets.udnfunlife.com/application/UTK01/UTK0101_.aspx"
 CONST_URBTIX_SIGN_IN_URL = "https://www.urbtix.hk/member-login"
+CONST_NOL_SIGN_IN_URL = "https://world.nol.com/login?lang=zh-CN"
 
 warnings.simplefilter('ignore',InsecureRequestWarning)
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -117,6 +119,11 @@ async def nodriver_goto_homepage(driver, config_dict):
             else:
                 # Type01: premier.hkticketing.com
                 homepage = CONST_HKTICKETING_SIGN_IN_URL
+
+    # NOL World (Interpark Global)
+    # Do NOT redirect to login page directly — Cloudflare blocks it.
+    # Instead, go to the event page and let NOL redirect naturally.
+    # The login handler will pick it up when NOL redirects to /login.
 
     # https://ticketplus.com.tw/*
     if 'ticketplus.com.tw' in homepage:
@@ -753,7 +760,9 @@ async def main(args):
 
         # Cloudflare challenge detection (only on URL change to avoid performance hit)
         # After 3 consecutive failures on same URL, stop retrying to avoid infinite loop
-        if not cloudflare_checked and cloudflare_fail_count < 3:
+        # Skip for NOL login page — its Turnstile is embedded in the form, not a blocking challenge
+        is_nol_login = 'nol.com' in url and '/login' in url
+        if not cloudflare_checked and cloudflare_fail_count < 3 and not is_nol_login:
             is_cloudflare = await detect_cloudflare_challenge(tab, show_debug=config_dict.get("advanced", {}).get("verbose", False))
             cloudflare_checked = True
             if is_cloudflare:
@@ -847,6 +856,19 @@ async def main(args):
         # FunOne Tickets
         if 'tickets.funone.io' in url:
             tab = await nodriver_funone_main(tab, url, config_dict)
+
+        # NOL World (Interpark Global) - handles nol.com, interpark.com/onestop, and globalinterpark.com
+        if 'nol.com' in url or ('interpark.com' in url and ('/onestop/' in url or '/gates/' in url or '/waiting' in url)) or 'globalinterpark.com' in url:
+            try:
+                is_quit_bot = await nodriver_nol_main(tab, url, config_dict)
+            except asyncio.CancelledError:
+                print("[NOL] ✅ Page transition (CancelledError caught)")
+                is_quit_bot = False
+            except Exception as e:
+                print(f"[NOL] Main dispatch error: {e}")
+                is_quit_bot = False
+            if is_quit_bot:
+                is_quit_bot = False
 
         # FANSI GO
         if 'go.fansi.me' in url:

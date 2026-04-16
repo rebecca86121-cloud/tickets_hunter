@@ -918,7 +918,7 @@ def get_nodriver_browser_args():
     return browser_args
 
 def get_extension_config(config_dict, args=None):
-    sandbox=True
+    sandbox=False
     browser_args = get_nodriver_browser_args()
     if len(config_dict["advanced"]["proxy_server_port"]) > 2:
         browser_args.append('--proxy-server=%s' % config_dict["advanced"]["proxy_server_port"])

@@ -257,6 +257,7 @@
 
                     <h6><strong>海外地區</strong></h6>
                     <div class="mb-0">
+                      <button type="button" class="btn btn-outline-info btn-sm me-2 mb-2" onclick="fillHomepage('https://world.nol.com/zh-CN/ticket')">NOL World 놀티켓</button>
                       <button type="button" class="btn btn-outline-secondary btn-sm me-2 mb-2" onclick="fillHomepage('https://ticket.urbtix.hk')">Urbtix 城市</button>
                       <button type="button" class="btn btn-outline-secondary btn-sm me-2 mb-2" onclick="fillHomepage('https://www.cityline.com')">Cityline 買飛</button>
                       <button type="button" class="btn btn-outline-secondary btn-sm me-2 mb-2" onclick="fillHomepage('https://hotshow.hkticketing.com/')">HKTicketing 快達票</button>
@@ -962,6 +963,20 @@
               <input type="text" id="ticketplus_account" value="" class="form-control" autocomplete="username">
               <span class="input-group-text" id="inputGroup-sizing-default">密碼</span>
               <input type="password" id="ticketplus_password" value="" class="form-control" autocomplete="current-password">
+            </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="row mb-3" data-under="nol">
+          <label for="nol_account" class="col-sm-2 col-form-label">NOL World</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <form autocomplete="off">
+            <div class="input-group">
+              <span class="input-group-text" id="inputGroup-sizing-default">帳號</span>
+              <input type="text" id="nol_account" value="" class="form-control" autocomplete="username" placeholder="Email">
+              <span class="input-group-text" id="inputGroup-sizing-default">密碼</span>
+              <input type="password" id="nol_password" value="" class="form-control" autocomplete="current-password">
             </div>
             </form>
           </div>
