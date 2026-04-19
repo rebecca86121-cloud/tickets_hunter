@@ -776,7 +776,11 @@ async def main(args):
                     cloudflare_fail_count += 1
                     cloudflare_checked = False  # Allow retry on next loop iteration
                     if cloudflare_fail_count >= 3:
-                        print("[CLOUDFLARE] Max failures reached, waiting for URL change to retry")
+                        print("[CLOUDFLARE] Max failures reached, reloading page to reset...")
+                        await tab.reload()
+                        await asyncio.sleep(3)
+                        cloudflare_fail_count = 0
+                        cloudflare_checked = False
 
         # for kktix.cc and kktix.com
         if 'kktix.c' in url:

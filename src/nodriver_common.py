@@ -54,7 +54,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 # "off"    - completely disable Cloudflare bypass
 CLOUDFLARE_BYPASS_MODE = "auto"
 CLOUDFLARE_MAX_RETRY = 3         # max retry count
-CLOUDFLARE_WAIT_TIME = 3         # wait time after each attempt (seconds)
+CLOUDFLARE_WAIT_TIME = 6         # wait time after each attempt (seconds)
 CLOUDFLARE_ENABLE_EXPERT_MODE = False  # True enables more aggressive browser args
 
 
