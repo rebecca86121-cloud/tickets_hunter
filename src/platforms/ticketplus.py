@@ -438,20 +438,28 @@ async def nodriver_ticketplus_date_auto_select(tab, config_dict):
 
             # Primary: read sessionId from Vue data layer, navigate directly
             # Avoids clicking loading-state placeholder containers
-            vue_data = await tab.evaluate('''
-                (function() {
-                    const el = document.querySelector('.eventClass');
-                    if (!el || !el.__vue__) return { ready: false };
-                    const sessions = el.__vue__.$data.sessions || [];
-                    const loaded = sessions.filter(function(s) { return s.loadingStatusFinished; });
-                    return {
-                        ready: loaded.length > 0,
-                        sessions: loaded.map(function(s) {
-                            return { sessionId: s.sessionId, date: s.date || '', name: s.name || '' };
-                        })
-                    };
-                })();
-            ''')
+            # Poll up to 1 second for Vue API to finish loading sessions
+            vue_data = None
+            for _retry in range(10):
+                _raw = await tab.evaluate('''
+                    (function() {
+                        const el = document.querySelector('.eventClass');
+                        if (!el || !el.__vue__) return { ready: false };
+                        const sessions = el.__vue__.$data.sessions || [];
+                        const loaded = sessions.filter(function(s) { return s.loadingStatusFinished; });
+                        return {
+                            ready: loaded.length > 0,
+                            sessions: loaded.map(function(s) {
+                                return { sessionId: s.sessionId, date: s.date || '', name: s.name || '' };
+                            })
+                        };
+                    })();
+                ''')
+                if isinstance(_raw, dict) and _raw.get('ready'):
+                    vue_data = _raw
+                    debug.log(f"[TicketPlus DATE] Vue sessions ready after {(_retry) * 100}ms")
+                    break
+                await asyncio.sleep(0.1)
 
             if isinstance(vue_data, dict) and vue_data.get('ready') and vue_data.get('sessions'):
                 sessions = vue_data['sessions']
