@@ -655,7 +655,7 @@ async def _nol_handle_date_selection(tab, url, config_dict):
     debug.log("[NOL] Handling date selection...")
 
     date_keyword = config_dict.get("date_auto_select", {}).get("date_keyword", "")
-    date_keywords = [k.strip() for k in date_keyword.split(";") if k.strip()] if date_keyword else []
+    date_keywords = util.parse_keyword_string_to_array(date_keyword)
 
     await asyncio.sleep(random.uniform(0.3, 0.6))
 
@@ -746,7 +746,7 @@ async def _nol_handle_seat_selection(tab, url, config_dict):
     debug.log("[NOL] Handling seat/area selection...")
 
     area_keyword = config_dict.get("area_auto_select", {}).get("area_keyword", "")
-    area_keywords = [k.strip() for k in area_keyword.split(";") if k.strip()] if area_keyword else []
+    area_keywords = util.parse_keyword_string_to_array(area_keyword)
     ticket_number = config_dict.get("ticket_number", 1)
 
     await asyncio.sleep(random.uniform(0.3, 0.6))
@@ -1730,7 +1730,7 @@ async def _nol_handle_onestop_schedule(tab, url, config_dict):
     debug.log("[NOL] On onestop schedule page (date/time selection)")
 
     date_keyword = config_dict.get("date_auto_select", {}).get("date_keyword", "")
-    date_keywords = [k.strip() for k in date_keyword.split(";") if k.strip()] if date_keyword else []
+    date_keywords = util.parse_keyword_string_to_array(date_keyword)
 
     await asyncio.sleep(random.uniform(0.5, 1.0))
 
@@ -2064,7 +2064,7 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
         # No CAPTCHA - proceed with seat selection
         print("[NOL] No CAPTCHA, proceeding to seat selection...")
         area_keyword = config_dict.get("area_auto_select", {}).get("area_keyword", "")
-        area_keywords = [k.strip() for k in area_keyword.split(";") if k.strip()] if area_keyword else []
+        area_keywords = util.parse_keyword_string_to_array(area_keyword)
         ticket_number = config_dict.get("ticket_number", 1)
 
         await asyncio.sleep(0.5)
@@ -3118,6 +3118,8 @@ async def _nol_handle_gpo_captcha(tab, config_dict):
         return False
 
 
+_gpo_kw_idx = 0  # tracks which area keyword to try next (rotates across iterations)
+
 async def _nol_handle_gpo_booking(tab, url, config_dict):
     """Handle old-style globalinterpark.com booking page (BookMain.asp).
     Flow: Select Date → Seat Map → Price/Discount → Delivery
@@ -3536,23 +3538,23 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
             # Support target date from config (date_auto_select.date_keyword)
             date_keyword = config_dict.get("date_auto_select", {}).get("date_keyword", "")
             # Extract target day numbers from keywords (e.g. "16" or "2026/5/16" or "5/16")
+            # Use parse_keyword_string_to_array to strip JSON quotes: '"5/2"' → '5/2'
+            import re as _re
             target_days = []
-            if date_keyword:
-                for kw in date_keyword.split(";"):
-                    kw = kw.strip()
-                    if not kw:
-                        continue
-                    # Try to extract day number: "16", "5/16", "2026/5/16", "20260516"
-                    import re as _re
-                    # Match pure number like "16"
-                    if _re.match(r'^\d{1,2}$', kw):
-                        target_days.append(int(kw))
-                    # Match "M/D" or "MM/DD"
-                    elif m := _re.search(r'(\d{1,2})[/\-](\d{1,2})$', kw):
-                        target_days.append(int(m.group(2)))
-                    # Match "YYYYMMDD"
-                    elif m := _re.match(r'\d{4}(\d{2})(\d{2})$', kw):
-                        target_days.append(int(m.group(2)))
+            for kw in util.parse_keyword_string_to_array(date_keyword):
+                kw = kw.strip()
+                if not kw:
+                    continue
+                # Try to extract day number: "16", "5/16", "2026/5/16", "20260516"
+                # Match pure number like "16"
+                if _re.match(r'^\d{1,2}$', kw):
+                    target_days.append(int(kw))
+                # Match "M/D" or "MM/DD"
+                elif m := _re.search(r'(\d{1,2})[/\-](\d{1,2})$', kw):
+                    target_days.append(int(m.group(2)))
+                # Match "YYYYMMDD"
+                elif m := _re.match(r'\d{4}(\d{2})(\d{2})$', kw):
+                    target_days.append(int(m.group(2)))
             target_days_json = json.dumps(target_days)
             print(f"[NOL-GPO] Target days from config: {target_days}")
 
@@ -3978,7 +3980,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
 
             # No CAPTCHA — handle seat/area selection on seat map
             area_keyword = config_dict.get("area_auto_select", {}).get("area_keyword", "")
-            area_keywords = [k.strip() for k in area_keyword.split(";") if k.strip()] if area_keyword else []
+            area_keywords = util.parse_keyword_string_to_array(area_keyword)
             ticket_number = config_dict.get("ticket_number", 1)
 
             # Use selectedSeatCount and hasCompletionBtn from step detection
@@ -4118,6 +4120,13 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
 
             area_keywords_json = json.dumps(area_keywords)
             ticket_number_val = int(ticket_number) if ticket_number else 1
+
+            # Zone rotation: use single keyword based on current index
+            global _gpo_kw_idx
+            current_area_kw = area_keywords[_gpo_kw_idx % len(area_keywords)] if area_keywords else None
+            current_area_kw_json = json.dumps([current_area_kw] if current_area_kw else [])
+            if current_area_kw:
+                print(f"[NOL-GPO] Zone rotation: trying keyword '{current_area_kw}' (idx={_gpo_kw_idx}, total={len(area_keywords)})")
 
             # Phase 1: Diagnostic scan — understand page structure
             diag_result = await tab.evaluate('''
@@ -4264,6 +4273,71 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
             if diag.get('seats'):
                 print(f"  Seats found: {len(diag['seats'])} (first 3: {diag['seats'][:3]})")
 
+            # Phase 1.5: Dump ifrmSeat (area map) and ifrmSeatDetail (individual seats)
+            seat_detail_dump = await tab.evaluate('''
+                (function() {
+                    function getNestedIfrDoc(rootDoc, id) {
+                        const iframes = rootDoc.querySelectorAll('iframe');
+                        for (const ifr of iframes) {
+                            if (ifr.id === id || ifr.name === id) {
+                                try { return ifr.contentDocument || ifr.contentWindow.document; } catch(e) { return null; }
+                            }
+                        }
+                        for (const ifr of iframes) {
+                            try {
+                                const ifrDoc = ifr.contentDocument || ifr.contentWindow.document;
+                                const found = getNestedIfrDoc(ifrDoc, id);
+                                if (found) return found;
+                            } catch(e) {}
+                        }
+                        return null;
+                    }
+
+                    const seatDoc = getNestedIfrDoc(document, 'ifrmSeat');
+                    if (!seatDoc || !seatDoc.body) return JSON.stringify({error: 'no_ifrmSeat'});
+                    const html = seatDoc.body.innerHTML;
+
+                    // Scan ALL elements — find anything with href, onclick, or class that isn't captcha
+                    const captchaIds = ['divCaptchaWrap', 'CaptchaTts'];
+                    const allEls = Array.from(seatDoc.querySelectorAll('a, [onclick], input, select, button'));
+                    const nonCaptchaEls = allEls.filter(el => {
+                        const oc = el.getAttribute('onclick') || '';
+                        const id = el.id || '';
+                        const cls = el.className || '';
+                        // Skip captcha elements
+                        if (captchaIds.includes(id)) return false;
+                        if (oc.toLowerCase().includes('captcha') || oc.toLowerCase().includes('audio')) return false;
+                        return true;
+                    });
+                    const elDump = nonCaptchaEls.slice(0, 20).map(el => {
+                        const oc = el.getAttribute('onclick') || '';
+                        const href = el.getAttribute('href') || '';
+                        const id = el.id || '';
+                        const cls = (el.className || '').substring(0, 20);
+                        const text = (el.textContent || el.value || '').trim().substring(0, 30);
+                        const name = el.getAttribute('name') || '';
+                        return el.tagName + '#' + id + '.' + cls + ' text="' + text + '" href=' + href.substring(0,40) + ' oc=' + oc.substring(0,60) + ' name=' + name;
+                    });
+
+                    // Look for select elements (zone dropdown?)
+                    const selects = Array.from(seatDoc.querySelectorAll('select')).map(s => {
+                        const opts = Array.from(s.options).slice(0,10).map(o => o.value + ':' + o.text.trim().substring(0,20));
+                        return 'select#' + (s.id||'') + ' name=' + (s.name||'') + ' opts=[' + opts.join(',') + ']';
+                    });
+
+                    // HTML slices to find the actual map area
+                    const slices = {
+                        '0-1000': html.substring(0, 1000),
+                        '5000-6500': html.substring(5000, 6500),
+                        '10000-11500': html.substring(10000, 11500),
+                        '25000-26500': html.substring(25000, 26500),
+                    };
+
+                    return JSON.stringify({totalLen: html.length, selects, elDump, slices});
+                })()
+            ''')
+            print(f"[NOL-GPO] Seat iframe dump: {seat_detail_dump}")
+
             # Phase 2: If individual seats are already visible (SelectSeat pattern),
             # skip area selection and go directly to seat clicking
             has_individual_seats = len(diag.get('seats', [])) > 0
@@ -4365,20 +4439,87 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                 print(f"[NOL-GPO] Seat click: {seat_click_result}")
 
                 if 'seats_clicked' in str(seat_click_result):
-                    # Wait a moment, then the loop will re-enter and detect "selected:" status
-                    # which triggers the enhanced completion button click
                     print("[NOL-GPO] ✅ Seats clicked, will detect and click completion on next cycle")
                     await asyncio.sleep(0.3)
+                    return True
+                else:
+                    # No seats available in current zone — reload to retry all zones
+                    print("[NOL-GPO] 🔄 No seats in zone, reloading to retry...")
+                    reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
+                    await asyncio.sleep(max(reload_interval, 1))
+                    await tab.reload()
                     return True
 
             # Phase 3: Click area/block on seat map
             # Strategy: Search inside ifrmSeatDetail FIRST (not main doc),
             # use <area> tags, filtered [onclick], and grade selectors
             if has_area_map or not has_individual_seats:
+                # Wait for <area> elements (dynamically loaded after fnSeatUpdate)
+                # Captcha was already submitted by captcha handler — only call fnSeatUpdate here,
+                # NOT fnCheck (re-calling fnCheck resubmits the captcha and disrupts area map loading)
+                _area_triggered = False
+                for _area_wait in range(20):
+                    _area_count = await tab.evaluate('''
+                        (function() {
+                            let count = 0;
+                            function countAreas(doc, depth) {
+                                if (!doc || !doc.body || depth > 5) return;
+                                count += doc.querySelectorAll('area').length;
+                                for (const ifr of doc.querySelectorAll('iframe')) {
+                                    try { countAreas(ifr.contentDocument || ifr.contentWindow.document, depth+1); } catch(e) {}
+                                }
+                            }
+                            countAreas(document, 0);
+                            return count;
+                        })()
+                    ''')
+                    if _area_count and int(_area_count) > 0:
+                        print(f"[NOL-GPO] Area map loaded: {_area_count} <area> elements found")
+                        break
+                    # At _area_wait==0 and _area_wait==5: call fnSeatUpdate to trigger area map load
+                    if _area_wait in (0, 5) and not (_area_wait == 5 and _area_triggered):
+                        _area_triggered = True
+                        print(f"[NOL-GPO] Calling fnSeatUpdate to load area map (attempt {_area_wait})...")
+                        await tab.evaluate('''
+                            (function() {
+                                function getIfrDoc(id) {
+                                    const ifr = document.getElementById(id);
+                                    if (!ifr) return null;
+                                    try { return ifr.contentDocument || ifr.contentWindow.document; } catch(e) { return null; }
+                                }
+                                const seatDoc = getIfrDoc('ifrmSeat');
+                                if (!seatDoc) return 'no_ifrmSeat';
+                                const playDate = seatDoc.getElementById('PlayDate');
+                                if (playDate && !playDate.value) {
+                                    for (const opt of playDate.options) {
+                                        if (opt.value) { playDate.value = opt.value; break; }
+                                    }
+                                }
+                                const playSeq = seatDoc.getElementById('PlaySeq');
+                                if (playSeq && !playSeq.value) {
+                                    for (const opt of playSeq.options) {
+                                        if (opt.value) { playSeq.value = opt.value; break; }
+                                    }
+                                }
+                                if (typeof seatDoc.defaultView.fnSeatUpdate === 'function') {
+                                    seatDoc.defaultView.fnSeatUpdate();
+                                    return 'fnSeatUpdate_called';
+                                }
+                                return 'fnSeatUpdate_not_found';
+                            })()
+                        ''')
+                    await asyncio.sleep(0.5)
+                else:
+                    # All areas still 0 after 7s → reload page and retry
+                    print("[NOL-GPO] ⚠️ No <area> elements after 7s — reloading page...")
+                    reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
+                    await asyncio.sleep(max(reload_interval, 1))
+                    await tab.reload()
+                    return True
                 print(f"[NOL-GPO] Phase 3: Clicking area/block on seat map...")
                 click_result = await tab.evaluate('''
                     (function() {
-                        const keywords = ''' + area_keywords_json + ''';
+                        const keywords = ''' + current_area_kw_json + ''';
 
                         // Blacklist: onclick handlers NOT related to seats/areas
                         const blacklist = [
@@ -4504,29 +4645,49 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                             return 'no_area_found: no_candidates debug=[]';
                         }
 
-                        // Keyword matching
+                        // Extract seat count from alt/title text e.g. "15 座" returns 15
+                        function getSeatCount(text) {
+                            const m = (text || '').match(/(\d+)\s*座/);
+                            return m ? parseInt(m[1]) : -1; // -1 = unknown (no count in text)
+                        }
+
+                        // Check if all <area> candidates have 0 seats (all sold out)
+                        const areaCandidates = allCandidates.filter(c => c.type === 'area');
+                        if (areaCandidates.length > 0) {
+                            const allZero = areaCandidates.every(c => getSeatCount(c.text) === 0);
+                            if (allZero) {
+                                return 'all_areas_zero_seats: reload_needed all=' + debugList.join('; ');
+                            }
+                        }
+
+                        // Keyword matching — prefer keyword match WITH seats > 0
                         if (keywords.length > 0) {
+                            // Pass 1: keyword match + seats > 0
                             for (const kw of keywords) {
                                 const kwLower = kw.toLowerCase();
                                 for (const c of allCandidates) {
                                     const matchText = ((c.text || '') + ' ' + (c.onclick || '') + ' ' + (c.id || '')).toLowerCase();
                                     if (matchText.includes(kwLower)) {
-                                        c.el.click();
-                                        return 'keyword_match: ' + kw + ' => ' + (c.text || c.id || '').substring(0, 40) +
-                                               ' onclick=' + c.onclick.substring(0, 40) + ' [' + c.frame + '] all=' + debugList.join('; ');
+                                        const seats = getSeatCount(c.text);
+                                        if (seats !== 0) { // seats > 0 or unknown (-1)
+                                            c.el.click();
+                                            return 'keyword_match: ' + kw + ' => ' + (c.text || c.id || '').substring(0, 40) +
+                                                   ' seats=' + seats + ' onclick=' + c.onclick.substring(0, 40) + ' [' + c.frame + ']';
+                                        }
                                     }
                                 }
                             }
-                            // Keyword specified but no match — still click first available
-                            // (better to enter some area than none)
+                            // Pass 2: keyword zone has 0 seats → rotate to next keyword (no fallback)
+                            return 'current_keyword_zero_seats: rotate_needed kw=' + keywords[0] + ' all=' + debugList.join('; ');
                         }
 
-                        // No keyword or no match — click first (highest priority) candidate
-                        const best = allCandidates[0];
+                        // No keyword — click first candidate with seats > 0, else first candidate
+                        const withSeats = allCandidates.find(c => getSeatCount(c.text) > 0);
+                        const best = withSeats || allCandidates[0];
                         best.el.click();
                         return 'auto_select: ' + (best.text || best.id || '').substring(0, 40) +
-                               ' onclick=' + best.onclick.substring(0, 40) + ' type=' + best.type +
-                               ' [' + best.frame + '] all=' + debugList.join('; ');
+                               ' seats=' + getSeatCount(best.text) + ' onclick=' + best.onclick.substring(0, 40) +
+                               ' type=' + best.type + ' [' + best.frame + ']';
                     })()
                 ''')
                 print(f"[NOL-GPO] Area click: {click_result}")
@@ -4582,6 +4743,100 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                         })()
                     ''')
                     print(f"[NOL-GPO] Fallback colored click: {fallback_result}")
+
+                # After clicking a zone, verify it has available seats (area map may not show counts)
+                if any(x in str(click_result) for x in ['keyword_match', 'auto_select', 'fallback_available']):
+                    print(f"[NOL-GPO] Zone clicked, checking for available seats in ifrmSeatDetail...")
+                    _zone_has_seats = False
+                    for _zone_wait in range(14):  # wait up to 7s
+                        await asyncio.sleep(0.5)
+                        zone_check = await tab.evaluate('''
+                            (function() {
+                                try {
+                                    const seatIfr = document.getElementById('ifrmSeat');
+                                    if (!seatIfr) return 'no_ifrmSeat';
+                                    const seatDoc = seatIfr.contentDocument || seatIfr.contentWindow.document;
+                                    const detailIfr = seatDoc.getElementById('ifrmSeatDetail');
+                                    if (!detailIfr) return 'no_ifrmSeatDetail';
+                                    const detailUrl = (detailIfr.contentWindow.location.href || '');
+                                    if (detailUrl.includes('loading.asp') || detailUrl === 'about:blank' || !detailUrl) {
+                                        return 'still_loading';
+                                    }
+                                    const detailDoc = detailIfr.contentDocument || detailIfr.contentWindow.document;
+                                    if (!detailDoc || !detailDoc.body) return 'no_detail_body';
+                                    const availSeats = detailDoc.querySelectorAll('[onclick*="SelectSeat"], [onclick*="selectSeat"]').length;
+                                    const bodyLen = detailDoc.body.innerHTML.length;
+                                    return JSON.stringify({avail: availSeats, bodyLen: bodyLen, url: detailUrl.split('/').slice(-1)[0].substring(0, 30)});
+                                } catch(e) {
+                                    return 'error:' + e.message.substring(0, 50);
+                                }
+                            })()
+                        ''')
+                        try:
+                            zd = json.loads(zone_check) if str(zone_check).startswith('{') else {}
+                            if zd.get('avail', 0) > 0:
+                                print(f"[NOL-GPO] ✅ Zone {current_area_kw} has {zd['avail']} available seats")
+                                _zone_has_seats = True
+                                break
+                            elif zd.get('bodyLen', 0) > 500 and zd.get('avail', 0) == 0:
+                                print(f"[NOL-GPO] Zone {current_area_kw} loaded but no available seats (bodyLen={zd.get('bodyLen')})")
+                                break  # zone is sold out
+                        except Exception:
+                            pass
+                        if 'still_loading' not in str(zone_check):
+                            print(f"[NOL-GPO] Zone check: {zone_check}")
+                    if not _zone_has_seats:
+                        _gpo_kw_idx += 1
+                        tried = _gpo_kw_idx % len(area_keywords) if area_keywords else 0
+                        exhausted_cycle = (tried == 0)
+                        if area_keywords and len(area_keywords) > 1 and not exhausted_cycle:
+                            next_kw = area_keywords[_gpo_kw_idx % len(area_keywords)]
+                            print(f"[NOL-GPO] 🔄 Zone {current_area_kw} sold out, rotating to '{next_kw}'...")
+                        else:
+                            # All zones exhausted — reset index and loop back to first zone
+                            # Do NOT reload page (causes blank page), just refresh area map
+                            _gpo_kw_idx = 0
+                            first_kw = area_keywords[0] if area_keywords else '?'
+                            print(f"[NOL-GPO] 🔄 All zones checked ({', '.join(area_keywords)}), restarting from '{first_kw}'...")
+                            reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
+                            await asyncio.sleep(max(reload_interval, 1))
+                            # Refresh area map via fnSeatUpdate instead of full page reload
+                            await tab.evaluate('''
+                                (function() {
+                                    const seatIfr = document.getElementById('ifrmSeat');
+                                    if (!seatIfr) return 'no_ifrmSeat';
+                                    try {
+                                        const seatDoc = seatIfr.contentDocument || seatIfr.contentWindow.document;
+                                        if (typeof seatDoc.defaultView.fnSeatUpdate === 'function') {
+                                            seatDoc.defaultView.fnSeatUpdate();
+                                            return 'fnSeatUpdate_called';
+                                        }
+                                    } catch(e) {}
+                                    return 'fnSeatUpdate_not_found';
+                                })()
+                            ''')
+                        return True
+
+                # All areas have 0 seats → reload and retry
+                if 'zero_seats: reload_needed' in str(click_result) or 'current_keyword_zero_seats' in str(click_result):
+                    _gpo_kw_idx += 1
+                    tried = _gpo_kw_idx % len(area_keywords) if area_keywords else 0
+                    exhausted_cycle = (tried == 0)  # wrapped back to start
+                    if area_keywords and len(area_keywords) > 1 and not exhausted_cycle:
+                        next_kw = area_keywords[_gpo_kw_idx % len(area_keywords)]
+                        print(f"[NOL-GPO] 🔄 Zone has no seats, rotating to keyword '{next_kw}'...")
+                        await asyncio.sleep(0.3)
+                        return True
+                    else:
+                        if area_keywords and len(area_keywords) > 1:
+                            print(f"[NOL-GPO] 🔄 All {len(area_keywords)} zones checked — reloading page...")
+                            _gpo_kw_idx = 0
+                        else:
+                            print("[NOL-GPO] 🔄 Zone has no seats, reloading page...")
+                        reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
+                        await asyncio.sleep(reload_interval)
+                        await tab.reload()
+                        return True
 
             await asyncio.sleep(0.3)
             return True
