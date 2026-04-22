@@ -909,9 +909,13 @@ async def _nol_handle_onestop_price(tab, url, config_dict):
 
         # Set up auto-accept for native browser dialogs
         async def _auto_accept_dialog_price(event: cdp.page.JavascriptDialogOpening):
-            print(f"[NOL] Auto-accepting browser dialog: {event.message[:50]}")
+            msg = (event.message or '').strip()
+            cancel_words = ['취소', '取消', 'cancel', 'Cancel']
+            is_cancel = any(w in msg for w in cancel_words)
+            should_accept = not is_cancel
+            print(f"[NOL] Browser dialog (price): '{msg[:50]}' → {'accept' if should_accept else 'dismiss'}")
             try:
-                await tab.send(cdp.page.handle_java_script_dialog(accept=True))
+                await tab.send(cdp.page.handle_java_script_dialog(accept=should_accept))
             except Exception:
                 pass
 
@@ -1555,33 +1559,70 @@ async def _nol_handle_captcha(tab, url, config_dict):
                 debug.log(f"[NOL] CDP screenshot failed: {e}")
                 return False
 
-        # ---- Step 2: OCR the image ----
-        ocr = _get_ocr()
-        if ocr is None:
+        # ---- Step 2: OCR the image — dual-model consensus ----
+        if ddddocr is None:
             debug.log("[NOL] ddddocr not available, manual CAPTCHA required")
             play_sound_while_ordering(config_dict)
             return False
 
+        # Cache both models as function attributes (avoid re-init overhead)
+        if not hasattr(_nol_handle_captcha, '_ocr_default'):
+            try:
+                _nol_handle_captcha._ocr_default = ddddocr.DdddOcr(show_ad=False)
+            except Exception:
+                _nol_handle_captcha._ocr_default = None
+        if not hasattr(_nol_handle_captcha, '_ocr_beta'):
+            try:
+                _nol_handle_captcha._ocr_beta = ddddocr.DdddOcr(show_ad=False, beta=True)
+            except Exception:
+                _nol_handle_captcha._ocr_beta = None
+
+        ocr_default = _nol_handle_captcha._ocr_default
+        ocr_beta = _nol_handle_captcha._ocr_beta
+        if ocr_default is None and ocr_beta is None:
+            debug.log("[NOL] No OCR model available")
+            return False
+
         img_bytes = base64.b64decode(img_data)
-        debug.log(f"[NOL] CAPTCHA image size: {len(img_bytes)} bytes")
-
-        # Preprocess image to remove noise and improve OCR accuracy
         processed_bytes = _preprocess_captcha_image(img_bytes)
-        debug.log(f"[NOL] Preprocessed image size: {len(processed_bytes)} bytes")
 
-        # Try OCR on preprocessed image first, fallback to raw image
-        ocr_answer = ocr.classification(processed_bytes)
-        if not ocr_answer or len(re.sub(r'[^a-zA-Z0-9]', '', ocr_answer).strip()) < 3:
-            debug.log(f"[NOL] Preprocessed OCR failed ({ocr_answer}), trying raw image...")
-            ocr_answer = ocr.classification(img_bytes)
+        def _clean(text):
+            return re.sub(r'[^a-zA-Z0-9]', '', text or '').strip().upper()
 
-        if ocr_answer:
-            # Clean up: remove spaces, keep alphanumeric
-            ocr_answer = re.sub(r'[^a-zA-Z0-9]', '', ocr_answer).strip()
-            print(f"[NOL] CAPTCHA OCR result: {ocr_answer}")
-        else:
+        def _score(text):
+            if not text:
+                return -10
+            s = len(text) - abs(len(text) - 6) * 3
+            if 4 <= len(text) <= 8:
+                s += 5
+            return s
+
+        candidates = []
+        for model, label in [(ocr_default, 'default'), (ocr_beta, 'beta')]:
+            if model is None:
+                continue
+            for img, suffix in [(processed_bytes, '+proc'), (img_bytes, '+raw')]:
+                try:
+                    r = _clean(model.classification(img))
+                    if r:
+                        candidates.append((label + suffix, r, _score(r)))
+                except Exception:
+                    pass
+
+        # Consensus: same answer from multiple models gets a score bonus
+        counts = {}
+        for _, text, _ in candidates:
+            counts[text] = counts.get(text, 0) + 1
+        candidates = [(n, t, s + (5 if counts[t] >= 2 else 0)) for n, t, s in candidates]
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        print(f"[NOL] CAPTCHA OCR candidates: {[(c[0], c[1], c[2]) for c in candidates]}")
+
+        if not candidates:
             debug.log("[NOL] CAPTCHA OCR returned empty")
             return False
+
+        ocr_answer = candidates[0][1]
+        print(f"[NOL] CAPTCHA OCR result: {ocr_answer} (consensus={counts.get(ocr_answer,1)})")
 
         if len(ocr_answer) < 3:
             debug.log(f"[NOL] CAPTCHA answer too short ({ocr_answer}), retrying...")
@@ -1727,90 +1768,233 @@ async def _nol_handle_onestop_schedule(tab, url, config_dict):
         return False
 
     debug = util.create_debug_logger(config_dict)
-    debug.log("[NOL] On onestop schedule page (date/time selection)")
+    print("[NOL] On onestop schedule page (date/time selection)")
 
     date_keyword = config_dict.get("date_auto_select", {}).get("date_keyword", "")
     date_keywords = util.parse_keyword_string_to_array(date_keyword)
 
+    # Extract target day/month from keyword (e.g. "5/17" → month=5, day=17)
+    target_month, target_day = '', ''
+    for kw in date_keywords:
+        kw_clean = re.sub(r'[\'"]', '', kw).strip()
+        parts = kw_clean.replace('-', '/').split('/')
+        if len(parts) >= 2:
+            target_month = parts[-2].lstrip('0') or parts[-2]
+            target_day = parts[-1].lstrip('0') or parts[-1]
+            break
+        elif kw_clean.isdigit() and 1 <= int(kw_clean) <= 31:
+            target_day = kw_clean
+            break
+
     await asyncio.sleep(random.uniform(0.5, 1.0))
 
     try:
-        # Check if a date is already selected (has blue circle)
-        # If date keywords are provided, try to click the matching date
-        if date_keywords:
-            date_clicked = await tab.evaluate(f'''
+        # Diagnostic dump — helps debug selector issues
+        page_dump = await tab.evaluate('''
+            (function() {
+                const btns = [...document.querySelectorAll('button')].map(b => ({
+                    text: b.textContent.trim().substring(0,30),
+                    cls: (b.className||'').substring(0,50),
+                    disabled: b.disabled
+                })).filter(b => b.text);
+                const clickable = [...document.querySelectorAll('[onclick], [role="button"], [role="gridcell"], td[class], li[class]')].slice(0,20).map(el => ({
+                    tag: el.tagName,
+                    text: el.textContent.trim().substring(0,20),
+                    cls: (el.className||'').substring(0,50),
+                    dataDate: el.getAttribute('data-date') || el.getAttribute('data-day') || ''
+                }));
+                return JSON.stringify({buttons: btns.slice(0,15), clickable: clickable});
+            })()
+        ''')
+        print(f"[NOL] Schedule page dump: {page_dump}")
+
+        # ---- Step 1: Select the correct date ----
+        date_result = 'no_match'
+        if target_day:
+            date_result = await tab.evaluate(f'''
                 (function() {{
-                    const keywords = {json.dumps(date_keywords)};
-                    // Find all clickable date elements in the calendar
-                    const dateEls = document.querySelectorAll('[class*="date"], [class*="day"], td, .calendar-day, [role="gridcell"]');
-                    for (const el of dateEls) {{
-                        const text = el.textContent.trim();
-                        for (const kw of keywords) {{
-                            if (text.includes(kw)) {{
+                    const targetDay = '{target_day}';
+                    const targetMonth = '{target_month}';
+
+                    // Strategy A: data-date attribute (e.g. data-date="20260517")
+                    const dataDateEls = document.querySelectorAll('[data-date], [data-day]');
+                    for (const el of dataDateEls) {{
+                        const v = el.getAttribute('data-date') || el.getAttribute('data-day') || '';
+                        if (v.endsWith(targetMonth.padStart(2,'0') + targetDay.padStart(2,'0')) ||
+                            v === targetDay || v.includes('-' + targetMonth.padStart(2,'0') + '-' + targetDay.padStart(2,'0'))) {{
+                            if (!el.disabled && !el.getAttribute('aria-disabled')) {{
                                 el.click();
-                                return 'clicked_date: ' + text;
+                                return 'clicked_data_attr: ' + v;
                             }}
                         }}
                     }}
+
+                    // Strategy B: onClick containing date string
+                    const allEls = document.querySelectorAll('[onclick]');
+                    for (const el of allEls) {{
+                        const oc = el.getAttribute('onclick') || '';
+                        if (oc.includes(targetMonth.padStart(2,'0') + targetDay.padStart(2,'0')) ||
+                            oc.includes('2026' + targetMonth.padStart(2,'0') + targetDay.padStart(2,'0'))) {{
+                            el.click();
+                            return 'clicked_onclick: ' + oc.substring(0, 40);
+                        }}
+                    }}
+
+                    // Strategy C: calendar cell with exact day number text
+                    const calendarSelectors = [
+                        '[role="gridcell"]', 'td', '.calendarDay', '[class*="calendarDay"]',
+                        '[class*="calendar_day"]', '[class*="CalendarDay"]',
+                        '[class*="date__"]', '[class*="__date"]', '[class*="day__"]'
+                    ];
+                    for (const sel of calendarSelectors) {{
+                        const cells = document.querySelectorAll(sel);
+                        for (const cell of cells) {{
+                            const text = cell.textContent.trim();
+                            // Exact match or "17일" pattern
+                            if (text === targetDay || text === targetDay + '일' || text === targetDay + '日') {{
+                                const isDisabled = cell.disabled ||
+                                    cell.getAttribute('aria-disabled') === 'true' ||
+                                    (cell.className || '').toLowerCase().includes('disabled') ||
+                                    (cell.className || '').toLowerCase().includes('unavail') ||
+                                    (cell.className || '').toLowerCase().includes('sold');
+                                if (!isDisabled) {{
+                                    cell.click();
+                                    return 'clicked_cell: sel=' + sel + ' text=' + text;
+                                }}
+                            }}
+                        }}
+                    }}
+
+                    // Strategy D: any button with exactly the day number
+                    const buttons = document.querySelectorAll('button, span, div');
+                    for (const btn of buttons) {{
+                        const text = btn.textContent.trim();
+                        if (text === targetDay) {{
+                            const isDisabled = btn.disabled ||
+                                (btn.className || '').toLowerCase().includes('disabled');
+                            if (!isDisabled) {{
+                                btn.click();
+                                return 'clicked_btn: ' + text;
+                            }}
+                        }}
+                    }}
+
                     return 'no_match';
                 }})()
             ''')
-            if date_clicked and 'clicked_date' in str(date_clicked):
-                debug.log(f"[NOL] Date selected by keyword: {date_clicked}")
-                await asyncio.sleep(0.5)
+            print(f"[NOL] Schedule date click: {date_result}")
+            if 'clicked' in str(date_result):
+                await asyncio.sleep(0.8)
 
-        # Check if a time slot needs to be selected
-        # From screenshot: "6:00 PM" is shown as a selectable time
-        time_selected = await tab.evaluate('''
-            (function() {
-                // Look for time slot elements and click the first available one
-                const timeEls = document.querySelectorAll('[class*="time"], [class*="session"], [class*="slot"]');
-                for (const el of timeEls) {
-                    const text = el.textContent.trim();
-                    if (text.match(/\\d+:\\d+/)) {
-                        // Check if not already selected
-                        if (!el.classList.contains('selected') && !el.classList.contains('active')) {
+        # ---- Step 2: Select time slot (with keyword awareness) ----
+        time_result = await tab.evaluate(f'''
+            (function() {{
+                const targetMonth = '{target_month}';
+                const targetDay = '{target_day}';
+                const needle = targetMonth && targetDay
+                    ? (targetMonth.padStart(2,'0') + '.' + targetDay.padStart(2,'0'))
+                    : '';
+
+                // Find time slot elements
+                const timeSelectors = [
+                    '[class*="time"]', '[class*="session"]', '[class*="slot"]',
+                    '[class*="schedule"]', '[class*="회차"]', '[class*="시간"]',
+                    'li', '[role="option"]', '[role="listitem"]'
+                ];
+
+                let allTimeEls = [];
+                for (const sel of timeSelectors) {{
+                    const els = [...document.querySelectorAll(sel)].filter(el => {{
+                        const text = el.textContent.trim();
+                        return /\\d{{1,2}}[:.：]\\d{{2}}/.test(text) ||
+                               text.includes('PM') || text.includes('AM') ||
+                               text.includes('오후') || text.includes('오전');
+                    }});
+                    allTimeEls = allTimeEls.concat(els);
+                }}
+
+                if (allTimeEls.length === 0) return 'no_time_found';
+
+                // If we have a target day, prefer slots matching that date
+                if (needle) {{
+                    for (const el of allTimeEls) {{
+                        const text = el.textContent.trim();
+                        const isSelected = el.classList.contains('selected') ||
+                            el.classList.contains('active') ||
+                            el.getAttribute('aria-selected') === 'true';
+                        if (text.includes(needle) && !isSelected) {{
                             el.click();
-                            return 'clicked_time: ' + text;
-                        }
-                        return 'already_selected: ' + text;
-                    }
-                }
-                return 'no_time_found';
-            })()
+                            return 'clicked_time_match: ' + text.substring(0,40);
+                        }}
+                        if (text.includes(needle) && isSelected) {{
+                            return 'already_selected: ' + text.substring(0,40);
+                        }}
+                    }}
+                }}
+
+                // Fallback: first non-selected available time
+                for (const el of allTimeEls) {{
+                    const text = el.textContent.trim();
+                    const isSelected = el.classList.contains('selected') ||
+                        el.classList.contains('active') ||
+                        el.getAttribute('aria-selected') === 'true';
+                    const isDisabled = el.disabled ||
+                        (el.className||'').toLowerCase().includes('disabled') ||
+                        (el.className||'').toLowerCase().includes('sold');
+                    if (!isSelected && !isDisabled) {{
+                        el.click();
+                        return 'clicked_time_fallback: ' + text.substring(0,40);
+                    }}
+                    if (isSelected) {{
+                        return 'already_selected: ' + text.substring(0,40);
+                    }}
+                }}
+                return 'no_available_time';
+            }})()
         ''')
-        if time_selected:
-            debug.log(f"[NOL] Time slot: {time_selected}")
+        print(f"[NOL] Schedule time: {time_result}")
+        if 'clicked' in str(time_result):
+            await asyncio.sleep(0.5)
 
+        # ---- Step 3: Click Next button ----
         await asyncio.sleep(0.3)
-
-        # Click "Next" button
         next_clicked = await tab.evaluate('''
             (function() {
-                const btns = document.querySelectorAll('button, a, input[type="submit"]');
+                const nextTexts = ['다음', '下一步', '次へ', 'Next', 'NEXT', 'next',
+                                   '선택완료', '확인', '좌석선택', '座位選擇', '選擇座位'];
+                const btns = document.querySelectorAll('button, a[role="button"], input[type="submit"]');
                 for (const btn of btns) {
                     const text = (btn.textContent || btn.value || '').trim();
-                    if (text === 'Next' || text === '下一步' || text === '다음' ||
-                        text === 'next' || text === 'NEXT' || text === '次へ') {
-                        btn.click();
-                        return 'clicked: ' + text;
+                    if (nextTexts.some(t => text === t || text.includes(t))) {
+                        if (!btn.disabled) {
+                            btn.click();
+                            return 'clicked: ' + text;
+                        }
                     }
+                }
+                // Fallback: last enabled button on page
+                const allBtns = [...document.querySelectorAll('button')].filter(b => !b.disabled);
+                if (allBtns.length > 0) {
+                    const last = allBtns[allBtns.length - 1];
+                    const text = last.textContent.trim();
+                    last.click();
+                    return 'clicked_last_btn: ' + text;
                 }
                 return 'not_found';
             })()
         ''')
+        print(f"[NOL] Schedule next: {next_clicked}")
 
         if next_clicked and 'clicked' in str(next_clicked):
-            debug.log(f"[NOL] Next button: {next_clicked}")
             await asyncio.sleep(1.0)
             play_sound_while_ordering(config_dict)
             return True
         else:
-            debug.log("[NOL] Could not find Next button")
+            print("[NOL] Could not find Next button on schedule page")
             return False
 
     except Exception as e:
-        debug.log(f"[NOL] Onestop schedule error: {e}")
+        print(f"[NOL] Onestop schedule error: {e}")
         return False
 
 
@@ -1851,11 +2035,17 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
         except Exception:
             pass
 
-        # Set up auto-accept for any native browser dialogs via CDP
+        # Set up auto-accept for native browser dialogs via CDP
+        # Reject empty-message dialogs — they are likely cancel confirmations, not order confirmations
         async def _auto_accept_dialog(event: cdp.page.JavascriptDialogOpening):
-            print(f"[NOL] Auto-accepting browser dialog: {event.message[:50]}")
+            msg = (event.message or '').strip()
+            cancel_words = ['취소', '取消', 'cancel', 'Cancel']
+            is_cancel = any(w in msg for w in cancel_words)
+            # Accept everything except explicit cancel dialogs (empty confirm = "proceed?")
+            should_accept = not is_cancel
+            print(f"[NOL] Browser dialog: '{msg[:60]}' → {'accept' if should_accept else 'dismiss'}")
             try:
-                await tab.send(cdp.page.handle_java_script_dialog(accept=True))
+                await tab.send(cdp.page.handle_java_script_dialog(accept=should_accept))
             except Exception:
                 pass
 
@@ -2168,23 +2358,95 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
             # ---- Strategy 2: New React onestop seat map (SVG/DOM circles) ----
             print("[NOL] New-style React seat map")
 
+            # Diagnostic: comprehensive seat map structure dump
+            svg_dump = await tab.evaluate('''
+                (function() {
+                    const result = {};
+
+                    // 1. SVG elements breakdown
+                    const svg = document.querySelector('svg');
+                    if (svg) {
+                        result.svgSize = {w: svg.getAttribute('width'), h: svg.getAttribute('height'), viewBox: svg.getAttribute('viewBox')};
+                        result.svgChildren = svg.children.length;
+                        // Sample child tags
+                        result.svgChildTags = [...svg.children].slice(0,10).map(c => c.tagName + (c.getAttribute('class') ? '.' + c.getAttribute('class').substring(0,30) : ''));
+                        // SVG paths/polygons
+                        const paths = svg.querySelectorAll('path, polygon, rect, g');
+                        result.svgPaths = paths.length;
+                        result.pathSamples = [...paths].slice(0,5).map(p => ({
+                            tag: p.tagName,
+                            cls: (p.getAttribute('class')||'').substring(0,50),
+                            fill: p.getAttribute('fill') || p.style.fill || window.getComputedStyle(p).fill || '',
+                            onclick: (p.getAttribute('onclick')||'').substring(0,50),
+                            rect: (() => {const r = p.getBoundingClientRect(); return {w:Math.round(r.width),h:Math.round(r.height)};})()
+                        }));
+                    }
+
+                    // 2. <area> image map elements
+                    const areas = document.querySelectorAll('area');
+                    result.areaTags = areas.length;
+                    result.areaSamples = [...areas].slice(0,5).map(a => ({
+                        alt: a.alt, shape: a.shape, href: (a.href||'').substring(0,50),
+                        onclick: (a.getAttribute('onclick')||'').substring(0,50)
+                    }));
+
+                    // 3. Elements with onClick that look like seat selectors
+                    const onclickEls = [...document.querySelectorAll('[onclick]')].filter(el => {
+                        const oc = el.getAttribute('onclick') || '';
+                        return oc.includes('seat') || oc.includes('Seat') || oc.includes('select') || oc.includes('Select');
+                    });
+                    result.seatOnclickCount = onclickEls.length;
+                    result.seatOnclickSamples = onclickEls.slice(0,5).map(el => ({
+                        tag: el.tagName, onclick: el.getAttribute('onclick').substring(0,60),
+                        cls: (el.getAttribute('class')||'').substring(0,40)
+                    }));
+
+                    // 4. Elements with data-seat attributes
+                    const dataSeats = document.querySelectorAll('[data-seat-id],[data-seat],[data-seatid],[data-index]');
+                    result.dataSeatCount = dataSeats.length;
+                    result.dataSeatSamples = [...dataSeats].slice(0,5).map(el => ({
+                        tag: el.tagName,
+                        seatId: el.getAttribute('data-seat-id') || el.getAttribute('data-seat') || el.getAttribute('data-seatid'),
+                        cls: (el.className||'').substring(0,50)
+                    }));
+
+                    // 5. Canvas elements
+                    result.canvases = [...document.querySelectorAll('canvas')].map(c => ({w: c.width, h: c.height}));
+
+                    return JSON.stringify(result);
+                })()
+            ''')
+            print(f"[NOL] Seat structure dump: {svg_dump}")
+
             # Try clicking available (purple/colored) seat dots
             # Step 1: Find available seat coordinates via JS
             seat_coords = await tab.evaluate('''
                 (function() {
-                    const circles = document.querySelectorAll('svg circle, svg rect');
+                    const circles = document.querySelectorAll('svg circle, svg rect, circle');
                     const available = [];
                     for (const c of circles) {
-                        const fill = (c.getAttribute('fill') || '').toLowerCase();
+                        // Use computed fill (handles CSS-set fill, not just SVG attribute)
+                        const attrFill = (c.getAttribute('fill') || '').toLowerCase();
+                        const computedFill = (window.getComputedStyle(c).fill || '').toLowerCase();
+                        const styleFill = (c.style.fill || '').toLowerCase();
+                        const fill = attrFill || styleFill || computedFill;
+
                         const cls = (c.getAttribute('class') || '').toLowerCase();
-                        const opacity = c.getAttribute('opacity') || '1';
-                        const isGray = fill === '#ccc' || fill === '#ddd' || fill === '#eee' ||
-                            fill === 'gray' || fill === '#e0e0e0' || fill === '#f0f0f0' ||
-                            fill === 'white' || fill === '#fff' || fill === '#ffffff' ||
-                            fill === 'none' || fill === 'transparent';
+                        const opacityAttr = parseFloat(c.getAttribute('opacity') || '1');
+                        const opacityStyle = parseFloat(window.getComputedStyle(c).opacity || '1');
+                        const opacity = Math.min(opacityAttr, opacityStyle);
+
+                        // Skip gray/white/none/transparent fills
+                        const isGray = fill.includes('#ccc') || fill.includes('#ddd') || fill.includes('#eee') ||
+                            fill === 'gray' || fill.includes('#e0e0e0') || fill.includes('#f0f0f0') ||
+                            fill === 'white' || fill.includes('#fff') || fill.includes('255, 255, 255') ||
+                            fill === 'none' || fill === 'transparent' || fill === 'rgba(0, 0, 0, 0)' || fill === '';
                         const isSold = cls.includes('sold') || cls.includes('disable') ||
                             cls.includes('unavail') || cls.includes('occupied');
-                        if (!isGray && !isSold && parseFloat(opacity) > 0.3 && fill !== '') {
+
+                        if (!isGray && !isSold && opacity > 0.3) {
+                            // Scroll into view first so getBoundingClientRect works
+                            c.scrollIntoView({block: 'center', inline: 'center'});
                             const rect = c.getBoundingClientRect();
                             if (rect.width > 0 && rect.height > 0) {
                                 available.push({
@@ -2282,8 +2544,109 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
             ''')
             print(f"[NOL] Fallback seat click result: {seat_result}")
 
+            # ---- Strategy 3: SeatGradeLayer (Interpark onestop grade-based auto-assign) ----
+            # Seat map is an <img>; interactive zones are React grade items.
+            # Flow: open grade panel → click matching grade → system auto-assigns seat.
+            if 'no_seats_found' in str(seat_result):
+                grade_result = await tab.evaluate(f'''
+                    (function() {{
+                        const areaKeywords = {json.dumps(area_keywords)};
+
+                        // Step A: open the grade panel if it's not already open
+                        const isActive = !!document.querySelector('[class*="SeatGradeLayer_layer"][class*="active"], [class*="SeatGradeLayer_active"]');
+                        if (!isActive) {{
+                            const toggleBtn = document.querySelector('[class*="SeatGradeLayer_toggleButton"]');
+                            if (toggleBtn) {{
+                                toggleBtn.click();
+                                return 'opened_grade_panel';
+                            }}
+                            return 'no_grade_toggle_btn';
+                        }}
+
+                        // Step B: find grade items
+                        const gradeItems = document.querySelectorAll('[class*="SeatGradeLayer_item"]');
+                        if (gradeItems.length === 0) return 'no_grade_items';
+
+                        // Priority 1: match area_keyword against grade text
+                        if (areaKeywords.length > 0) {{
+                            for (const item of gradeItems) {{
+                                const text = item.textContent.trim().toLowerCase();
+                                for (const kw of areaKeywords) {{
+                                    if (text.includes(kw.toLowerCase())) {{
+                                        item.click();
+                                        return 'clicked_grade_keyword: ' + item.textContent.trim().substring(0, 40);
+                                    }}
+                                }}
+                            }}
+                        }}
+
+                        // Priority 2: first grade with a colored (non-gray) dot
+                        for (const item of gradeItems) {{
+                            const dot = item.querySelector('[class*="SeatGradeLayer_dot"], [class*="_dot"]');
+                            if (dot) {{
+                                const color = window.getComputedStyle(dot).backgroundColor;
+                                const isGray = color === 'rgb(204, 204, 204)' || color === 'rgba(0, 0, 0, 0)' ||
+                                    color === 'rgb(238, 238, 238)' || color === 'rgb(153, 153, 153)' ||
+                                    color === 'rgb(255, 255, 255)';
+                                if (!isGray) {{
+                                    item.click();
+                                    return 'clicked_grade_colored: ' + item.textContent.trim().substring(0, 40) + ' color=' + color;
+                                }}
+                            }}
+                        }}
+
+                        // Priority 3: just click the first item
+                        gradeItems[0].click();
+                        return 'clicked_grade_first: ' + gradeItems[0].textContent.trim().substring(0, 40);
+                    }})()
+                ''')
+                print(f"[NOL] Grade layer result: {grade_result}")
+
+                if 'opened_grade_panel' in str(grade_result):
+                    # Panel just opened — loop back so next iteration can click a grade
+                    await asyncio.sleep(0.8)
+                    return True
+                elif 'clicked_grade' in str(grade_result):
+                    # Grade selected — wait to see if page navigates (auto-assign) or stays
+                    try:
+                        url_before = await tab.evaluate('location.href')
+                        print(f"[NOL] URL before grade wait: {url_before}")
+                    except Exception:
+                        url_before = ''
+                    await asyncio.sleep(2.5)
+                    try:
+                        url_after = await tab.evaluate('location.href')
+                        print(f"[NOL] URL after grade wait: {url_after}")
+                        if url_after != url_before:
+                            print(f"[NOL] ⚡ Page navigated after grade click → {url_after}")
+                            # Page moved — let main loop handle the new URL
+                            return True
+                    except Exception:
+                        pass
+                    # Still on seat page — look for a confirm/payment button that appeared
+                    confirm_btn = await tab.evaluate('''
+                        (function() {
+                            const keywords = ['완료', '결제', '구매', '확인', '다음', 'next', '付款',
+                                              '確認', '下一步', 'Next', 'proceed', 'payment', 'buy'];
+                            const btns = document.querySelectorAll('button, a[role="button"]');
+                            for (const btn of btns) {
+                                const text = (btn.textContent || '').trim();
+                                if (!text) continue;
+                                for (const kw of keywords) {
+                                    if (text.includes(kw)) {
+                                        btn.click();
+                                        return 'clicked_confirm: ' + text.substring(0, 40);
+                                    }
+                                }
+                            }
+                            return 'no_confirm_btn';
+                        })()
+                    ''')
+                    print(f"[NOL] Post-grade confirm: {confirm_btn}")
+                    return True
+
         # Wait for seat selection to register
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.0)
 
         # Check if a seat was actually selected (look for selected/highlighted state)
         selected_info = await tab.evaluate('''
@@ -2304,7 +2667,10 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
         print(f"[NOL] Seat selection state: {selected_info}")
 
         # Only proceed if a seat was actually clicked successfully
-        if 'no_seats_found' in str(seat_result):
+        still_stuck = ('no_seats_found' in str(seat_result) and
+                       'clicked_grade' not in str(seat_result) and
+                       'grade_panel_opened' not in str(seat_result))
+        if still_stuck:
             print("[NOL] ⚠️ 尚未選到座位，等待下次嘗試...")
             return True
 
@@ -3631,18 +3997,20 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                         const isSelected = isRed || styleRed;
                         const isUnavailable = isTextUnavailable && !isAvailable;
 
-                        if (isUnavailable && !isAvailable) continue; // Skip definitely unavailable
-
-                        // Check if target day
+                        // Check if target day BEFORE filtering
                         const isTarget = targetDays.length > 0 && targetDays.includes(num);
+
+                        // Skip unavailable dates — but NEVER skip the target date
+                        // (target date may become available when sale opens)
+                        if (isUnavailable && !isAvailable && !isTarget) continue;
 
                         // Priority system
                         let priority = 99;
                         if (targetDays.length > 0) {
                             if (isTarget && isAvailable) priority = 1;
-                            else if (isTarget) priority = 2;
-                            else if (isAvailable) priority = 3;
-                            else if (isSelected) priority = 4;
+                            else if (isTarget) priority = 2;      // target but not yet available → keep trying
+                            else if (isAvailable) priority = 10;  // available but wrong date → avoid
+                            else if (isSelected) priority = 11;
                         } else {
                             if (isAvailable) priority = 1;
                             else if (isSelected) priority = 2;
@@ -3662,6 +4030,10 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
 
                     if (candidates.length > 0) {
                         const c = candidates[0];
+                        // If target days configured but best candidate is NOT the target → wait
+                        if (targetDays.length > 0 && !targetDays.includes(c.num)) {
+                            return 'waiting_for_target: best=' + c.num + ' target=' + JSON.stringify(targetDays) + ' avail=' + c.isAvailable;
+                        }
                         // Click: try link inside td first, then td itself
                         if (c.link) {
                             c.link.click();
@@ -3680,23 +4052,54 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                 print("[NOL-GPO] ⚠️ No available dates found — dumping debug info above")
                 return True
 
+            if 'waiting_for_target' in str(date_result):
+                print(f"[NOL-GPO] ⏳ Target date not yet available, waiting... ({date_result})")
+                await asyncio.sleep(1.0)
+                return True
+
             await asyncio.sleep(1.5)
 
             # Select time if dropdown exists (check BOTH main doc and iframe)
             time_result = await tab.evaluate('''
                 (function() {
-                    // Check main document first
+                    const dateKw = ''' + json.dumps(date_keyword) + ''';
+                    // Parse date keyword to get target month+day for matching option text
+                    let targetMonth = '', targetDay = '';
+                    if (dateKw) {
+                        const clean = dateKw.replace(/['"]/g, '');
+                        const parts = clean.split('/');
+                        if (parts.length >= 2) {
+                            targetDay = parts[parts.length-1].padStart(2,'0');
+                            targetMonth = parts[parts.length-2].padStart(2,'0');
+                        } else if (/^\\d{8}$/.test(clean)) {
+                            targetMonth = clean.slice(4,6);
+                            targetDay = clean.slice(6,8);
+                        }
+                    }
+
                     function findAndSelectTime(doc) {
                         if (!doc) return null;
                         const selects = doc.querySelectorAll('select');
                         for (const sel of selects) {
                             if (sel.options.length > 1) {
-                                // Select first non-empty option
+                                // Try to match target date first when date_keyword is set
+                                if (targetMonth && targetDay) {
+                                    const needle = '-' + targetMonth + '-' + targetDay;
+                                    for (let i = 0; i < sel.options.length; i++) {
+                                        const txt = sel.options[i].text || sel.options[i].value;
+                                        if (sel.options[i].value && txt.includes(needle)) {
+                                            sel.selectedIndex = i;
+                                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                            return 'selected_time: ' + sel.options[i].text + ' (index=' + i + ') [keyword_match]';
+                                        }
+                                    }
+                                }
+                                // Fallback: first non-empty option
                                 for (let i = 0; i < sel.options.length; i++) {
                                     if (sel.options[i].value && sel.options[i].value !== '') {
                                         sel.selectedIndex = i;
                                         sel.dispatchEvent(new Event('change', {bubbles: true}));
-                                        return 'selected_time: ' + sel.options[i].text + ' (index=' + i + ')';
+                                        return 'selected_time: ' + sel.options[i].text + ' (index=' + i + ') [fallback]';
                                     }
                                 }
                             }
@@ -3982,6 +4385,7 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
             area_keyword = config_dict.get("area_auto_select", {}).get("area_keyword", "")
             area_keywords = util.parse_keyword_string_to_array(area_keyword)
             ticket_number = config_dict.get("ticket_number", 1)
+            date_keyword = config_dict.get("date_auto_select", {}).get("date_keyword", "")
 
             # Use selectedSeatCount and hasCompletionBtn from step detection
             seat_count = int(info.get('selectedSeatCount', 0))
@@ -4443,11 +4847,32 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                     await asyncio.sleep(0.3)
                     return True
                 else:
-                    # No seats available in current zone — reload to retry all zones
-                    print("[NOL-GPO] 🔄 No seats in zone, reloading to retry...")
-                    reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
-                    await asyncio.sleep(max(reload_interval, 1))
-                    await tab.reload()
+                    # No seats available in current zone — rotate to next keyword
+                    _gpo_kw_idx += 1
+                    tried = _gpo_kw_idx % len(area_keywords) if area_keywords else 0
+                    exhausted_cycle = (tried == 0)
+                    if area_keywords and len(area_keywords) > 1 and not exhausted_cycle:
+                        next_kw = area_keywords[_gpo_kw_idx % len(area_keywords)]
+                        print(f"[NOL-GPO] 🔄 No individual seats in zone, rotating to '{next_kw}'...")
+                    else:
+                        _gpo_kw_idx = 0
+                        print("[NOL-GPO] 🔄 All zones checked (individual seats), refreshing seat map...")
+                        reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
+                        await asyncio.sleep(max(reload_interval, 1))
+                        await tab.evaluate('''
+                            (function() {
+                                const seatIfr = document.getElementById('ifrmSeat');
+                                if (!seatIfr) return 'no_ifrmSeat';
+                                try {
+                                    const seatDoc = seatIfr.contentDocument || seatIfr.contentWindow.document;
+                                    if (typeof seatDoc.defaultView.fnSeatUpdate === 'function') {
+                                        seatDoc.defaultView.fnSeatUpdate();
+                                        return 'fnSeatUpdate_called';
+                                    }
+                                } catch(e) {}
+                                return 'fnSeatUpdate_not_found';
+                            })()
+                        ''')
                     return True
 
             # Phase 3: Click area/block on seat map
@@ -4490,31 +4915,70 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                                 const seatDoc = getIfrDoc('ifrmSeat');
                                 if (!seatDoc) return 'no_ifrmSeat';
                                 const playDate = seatDoc.getElementById('PlayDate');
-                                if (playDate && !playDate.value) {
-                                    for (const opt of playDate.options) {
-                                        if (opt.value) { playDate.value = opt.value; break; }
+                                if (playDate) {
+                                    const dateKw = ''' + json.dumps(date_keyword) + ''';
+                                    let matched = null;
+                                    // When date_keyword is set, always match correct date (override any pre-selected value)
+                                    if (dateKw) {
+                                        const kwParts = dateKw.replace(/['"]/g, '').split('/');
+                                        const targetDay = kwParts.length >= 2 ? kwParts[kwParts.length-1].padStart(2,'0') : '';
+                                        const targetMonth = kwParts.length >= 2 ? kwParts[kwParts.length-2].padStart(2,'0') : '';
+                                        for (const opt of playDate.options) {
+                                            if (!opt.value) continue;
+                                            const txt = (opt.text || opt.value);
+                                            if (targetDay && targetMonth && txt.includes('-' + targetMonth + '-' + targetDay)) {
+                                                matched = opt.value; break;
+                                            }
+                                        }
+                                    }
+                                    // Fallback: first non-empty option (only if no value set and no keyword match)
+                                    if (!matched && !playDate.value) {
+                                        for (const opt of playDate.options) {
+                                            if (opt.value) { matched = opt.value; break; }
+                                        }
+                                    }
+                                    if (matched) {
+                                        playDate.value = matched;
+                                        playDate.dispatchEvent(new Event('change', {bubbles: true}));
                                     }
                                 }
                                 const playSeq = seatDoc.getElementById('PlaySeq');
                                 if (playSeq && !playSeq.value) {
                                     for (const opt of playSeq.options) {
-                                        if (opt.value) { playSeq.value = opt.value; break; }
+                                        if (opt.value) {
+                                            playSeq.value = opt.value;
+                                            playSeq.dispatchEvent(new Event('change', {bubbles: true}));
+                                            break;
+                                        }
                                     }
                                 }
                                 if (typeof seatDoc.defaultView.fnSeatUpdate === 'function') {
                                     seatDoc.defaultView.fnSeatUpdate();
-                                    return 'fnSeatUpdate_called';
+                                    return 'fnSeatUpdate_called date=' + (playDate ? playDate.value : 'n/a');
                                 }
                                 return 'fnSeatUpdate_not_found';
                             })()
                         ''')
                     await asyncio.sleep(0.5)
                 else:
-                    # All areas still 0 after 7s → reload page and retry
-                    print("[NOL-GPO] ⚠️ No <area> elements after 7s — reloading page...")
+                    # Area map failed to load after 7s — refresh via fnSeatUpdate (NOT tab.reload)
+                    print("[NOL-GPO] ⚠️ No <area> elements after 7s — refreshing seat map...")
                     reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
                     await asyncio.sleep(max(reload_interval, 1))
-                    await tab.reload()
+                    await tab.evaluate('''
+                        (function() {
+                            const seatIfr = document.getElementById('ifrmSeat');
+                            if (!seatIfr) return 'no_ifrmSeat';
+                            try {
+                                const seatDoc = seatIfr.contentDocument || seatIfr.contentWindow.document;
+                                if (typeof seatDoc.defaultView.fnSeatUpdate === 'function') {
+                                    seatDoc.defaultView.fnSeatUpdate();
+                                    return 'fnSeatUpdate_called';
+                                }
+                            } catch(e) {}
+                            return 'fnSeatUpdate_not_found';
+                        })()
+                    ''')
                     return True
                 print(f"[NOL-GPO] Phase 3: Clicking area/block on seat map...")
                 click_result = await tab.evaluate('''
@@ -4743,9 +5207,40 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                         })()
                     ''')
                     print(f"[NOL-GPO] Fallback colored click: {fallback_result}")
+                    # If colored fallback clicked something, promote it as click_result
+                    # so post-click verification runs correctly below
+                    if 'colored_click' in str(fallback_result):
+                        click_result = fallback_result
+                    # If colored fallback also found nothing, rotate to next keyword
+                    if 'no_colored_clickable' in str(fallback_result):
+                        _gpo_kw_idx += 1
+                        tried = _gpo_kw_idx % len(area_keywords) if area_keywords else 0
+                        exhausted_cycle = (tried == 0)
+                        if area_keywords and len(area_keywords) > 1 and not exhausted_cycle:
+                            next_kw = area_keywords[_gpo_kw_idx % len(area_keywords)]
+                            print(f"[NOL-GPO] 🔄 No area found, rotating to '{next_kw}'...")
+                        else:
+                            _gpo_kw_idx = 0
+                            print("[NOL-GPO] 🔄 No area found in any zone, refreshing seat map...")
+                            await tab.evaluate('''
+                                (function() {
+                                    const seatIfr = document.getElementById('ifrmSeat');
+                                    if (!seatIfr) return 'no_ifrmSeat';
+                                    try {
+                                        const seatDoc = seatIfr.contentDocument || seatIfr.contentWindow.document;
+                                        if (typeof seatDoc.defaultView.fnSeatUpdate === 'function') {
+                                            seatDoc.defaultView.fnSeatUpdate();
+                                            return 'fnSeatUpdate_called';
+                                        }
+                                    } catch(e) {}
+                                    return 'fnSeatUpdate_not_found';
+                                })()
+                            ''')
+                        await asyncio.sleep(0.5)
+                        return True
 
                 # After clicking a zone, verify it has available seats (area map may not show counts)
-                if any(x in str(click_result) for x in ['keyword_match', 'auto_select', 'fallback_available']):
+                if any(x in str(click_result) for x in ['keyword_match', 'auto_select', 'fallback_available', 'colored_click']):
                     print(f"[NOL-GPO] Zone clicked, checking for available seats in ifrmSeatDetail...")
                     _zone_has_seats = False
                     for _zone_wait in range(14):  # wait up to 7s
@@ -4828,14 +5323,28 @@ async def _nol_handle_gpo_booking(tab, url, config_dict):
                         await asyncio.sleep(0.3)
                         return True
                     else:
+                        _gpo_kw_idx = 0
                         if area_keywords and len(area_keywords) > 1:
-                            print(f"[NOL-GPO] 🔄 All {len(area_keywords)} zones checked — reloading page...")
-                            _gpo_kw_idx = 0
+                            first_kw = area_keywords[0]
+                            print(f"[NOL-GPO] 🔄 All zones checked ({', '.join(area_keywords)}), restarting from '{first_kw}'...")
                         else:
-                            print("[NOL-GPO] 🔄 Zone has no seats, reloading page...")
+                            print("[NOL-GPO] 🔄 Zone has no seats, refreshing seat map...")
                         reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 3)
-                        await asyncio.sleep(reload_interval)
-                        await tab.reload()
+                        await asyncio.sleep(max(reload_interval, 1))
+                        await tab.evaluate('''
+                            (function() {
+                                const seatIfr = document.getElementById('ifrmSeat');
+                                if (!seatIfr) return 'no_ifrmSeat';
+                                try {
+                                    const seatDoc = seatIfr.contentDocument || seatIfr.contentWindow.document;
+                                    if (typeof seatDoc.defaultView.fnSeatUpdate === 'function') {
+                                        seatDoc.defaultView.fnSeatUpdate();
+                                        return 'fnSeatUpdate_called';
+                                    }
+                                } catch(e) {}
+                                return 'fnSeatUpdate_not_found';
+                            })()
+                        ''')
                         return True
 
             await asyncio.sleep(0.3)
@@ -5254,6 +5763,31 @@ async def nodriver_nol_main(tab, url, config_dict):
             debug.log(f"[NOL] On onestop page: {url}")
             # Try to auto-click Next on unknown onestop pages
             await _nol_click_next_step(tab, debug)
+            return is_quit_bot
+
+        # Handle non-onestop Interpark pages (e.g. /pocket — ticket hold after grade selection)
+        if 'tickets.interpark.com' in url:
+            print(f"[NOL] On Interpark page (not onestop): {url}")
+            # Try to find checkout/payment button (pocket → payment flow)
+            btn_result = await tab.evaluate('''
+                (function() {
+                    const keywords = ['결제', '구매', 'payment', 'checkout', '付款', '結帳',
+                                      '주문', '확인', '다음', 'Next', '下一步', 'proceed'];
+                    const btns = document.querySelectorAll('button, a[role="button"], a.btn, input[type="submit"]');
+                    for (const btn of btns) {
+                        const text = (btn.textContent || btn.value || '').trim();
+                        if (!text) continue;
+                        for (const kw of keywords) {
+                            if (text.includes(kw)) {
+                                btn.click();
+                                return 'clicked: ' + text.substring(0, 40);
+                            }
+                        }
+                    }
+                    return 'no_payment_btn: ' + document.title.substring(0, 40);
+                })()
+            ''')
+            print(f"[NOL] Interpark page button result: {btn_result}")
             return is_quit_bot
 
         # Step 2.5: Handle old-style globalinterpark.com booking flow
