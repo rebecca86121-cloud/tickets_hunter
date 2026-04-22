@@ -2689,8 +2689,9 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                                         circle_data = json.loads(circ_n)
                                     except Exception:
                                         pass
-                                    if circle_data.get('total', 0) > 1:
-                                        break  # circles appeared, exit loop
+                                    if circle_data.get('available'):
+                                        break  # found available seats — stop trying positions
+                                    # else: circles loaded but all disabled → try next position
                             except Exception as e:
                                 print(f"[NOL] CDP zone click error: {e}")
 
@@ -2710,8 +2711,9 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                         seat_result = f"cdp_seat_click: {seat_info.get('id', '')}"
                         print(f"[NOL] ✅ Seat circle clicked: {seat_result}")
                     elif circle_data.get('total', 0) > 1:
-                        print(f"[NOL] ⚠️ {circle_data['total']} seat circles found but all sold out in this zone")
-                        return True  # retry next iteration
+                        # Circles loaded but all disabled — retry from the start next iteration
+                        print(f"[NOL] ⚠️ {circle_data['total']} seat circles all sold/disabled, retrying...")
+                        return True
                     else:
                         # No circles at all — fallback: treat grade selection as seat selection
                         print("[NOL] No seat circles found, falling through with grade-only selection...")
