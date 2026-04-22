@@ -2544,30 +2544,26 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
             ''')
             print(f"[NOL] Fallback seat click result: {seat_result}")
 
-            # ---- Strategy 3: SeatGradeLayer (Interpark onestop grade-based auto-assign) ----
-            # Seat map is an <img>; interactive zones are React grade items.
-            # Flow: open grade panel → click matching grade → system auto-assigns seat.
+            # ---- Strategy 3: SeatGradeLayer + CDP zone click + seat circle ----
+            # Real Interpark flow (confirmed from DevTools):
+            #   1. Open grade panel (各等级价格) → click grade to filter map
+            #   2. CDP-click the seat map image → page loads individual seat circles
+            #   3. Find available circle.js-seat (not disabled) → CDP-click it
+            #   4. "完成選擇" button appears → _nol_click_next_step clicks it (Priority 1)
             if 'no_seats_found' in str(seat_result):
+
+                # Step A: open grade panel and click a grade
                 grade_result = await tab.evaluate(f'''
                     (function() {{
                         const areaKeywords = {json.dumps(area_keywords)};
-
-                        // Step A: open the grade panel if it's not already open
                         const isActive = !!document.querySelector('[class*="SeatGradeLayer_layer"][class*="active"], [class*="SeatGradeLayer_active"]');
                         if (!isActive) {{
                             const toggleBtn = document.querySelector('[class*="SeatGradeLayer_toggleButton"]');
-                            if (toggleBtn) {{
-                                toggleBtn.click();
-                                return 'opened_grade_panel';
-                            }}
+                            if (toggleBtn) {{ toggleBtn.click(); return 'opened_grade_panel'; }}
                             return 'no_grade_toggle_btn';
                         }}
-
-                        // Step B: find grade items
                         const gradeItems = document.querySelectorAll('[class*="SeatGradeLayer_item"]');
                         if (gradeItems.length === 0) return 'no_grade_items';
-
-                        // Priority 1: match area_keyword against grade text
                         if (areaKeywords.length > 0) {{
                             for (const item of gradeItems) {{
                                 const text = item.textContent.trim().toLowerCase();
@@ -2579,8 +2575,6 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                                 }}
                             }}
                         }}
-
-                        // Priority 2: first grade with a colored (non-gray) dot
                         for (const item of gradeItems) {{
                             const dot = item.querySelector('[class*="SeatGradeLayer_dot"], [class*="_dot"]');
                             if (dot) {{
@@ -2594,8 +2588,6 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                                 }}
                             }}
                         }}
-
-                        // Priority 3: just click the first item
                         gradeItems[0].click();
                         return 'clicked_grade_first: ' + gradeItems[0].textContent.trim().substring(0, 40);
                     }})()
@@ -2603,94 +2595,127 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                 print(f"[NOL] Grade layer result: {grade_result}")
 
                 if 'opened_grade_panel' in str(grade_result):
-                    # Panel just opened — loop back so next iteration can click a grade
                     await asyncio.sleep(0.8)
                     return True
+
                 elif 'clicked_grade' in str(grade_result):
-                    # Grade selected — wait to see if page navigates (auto-assign) or stays
+                    # Grade clicked — short wait then proceed to zone click
+                    await asyncio.sleep(1.2)
                     try:
-                        url_before = await tab.evaluate('location.href')
-                        print(f"[NOL] URL before grade wait: {url_before}")
-                    except Exception:
-                        url_before = ''
-                    await asyncio.sleep(2.0)
-                    try:
-                        url_after = await tab.evaluate('location.href')
-                        print(f"[NOL] URL after grade wait: {url_after}")
-                        if url_after != url_before:
-                            print(f"[NOL] ⚡ Page navigated after grade click → {url_after}")
+                        url_after_grade = await tab.evaluate('location.href')
+                        if url_after_grade != url:
+                            print(f"[NOL] ⚡ Page navigated after grade click → {url_after_grade}")
                             return True
                     except Exception:
                         pass
 
-                    # Scan for interactive zone elements that appeared after grade selection
-                    zone_scan = await tab.evaluate('''
+                    # Step B: helper JS to find available seat circles
+                    _seat_circle_js = '''
                         (function() {
-                            // 1. SVG clickable paths/zones
-                            const svgClickable = [];
-                            for (const el of document.querySelectorAll('svg path, svg polygon, svg circle[r!="1"], svg rect, svg g')) {
-                                const style = window.getComputedStyle(el);
-                                if (style.pointerEvents === 'none') continue;
-                                const r = el.getBoundingClientRect();
-                                if (r.width < 5) continue;
-                                svgClickable.push({tag: el.tagName, cls: (el.className.baseVal||'').substring(0,40),
-                                    x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2), w: Math.round(r.width)});
+                            const seats = document.querySelectorAll('circle.js-seat');
+                            const svgEl = document.querySelector('svg');
+                            if (!svgEl) return JSON.stringify({total: 0, available: []});
+                            const svgRect = svgEl.getBoundingClientRect();
+                            const vb = svgEl.viewBox.baseVal;
+                            const scaleX = vb.width  ? svgRect.width  / vb.width  : 1;
+                            const scaleY = vb.height ? svgRect.height / vb.height : 1;
+                            let total = 0;
+                            const available = [];
+                            for (const s of seats) {
+                                const cls = s.className.baseVal || '';
+                                const cx = parseFloat(s.getAttribute('cx')) || 0;
+                                const cy = parseFloat(s.getAttribute('cy')) || 0;
+                                if (cx < 1 && cy < 1) continue; // skip dummy at 0,0
+                                total++;
+                                if (cls.toLowerCase().includes('disabled')) continue;
+                                if (cls.toLowerCase().includes('selected')) continue;
+                                const sx = svgRect.left + cx * scaleX;
+                                const sy = svgRect.top  + cy * scaleY;
+                                available.push({x: Math.round(sx), y: Math.round(sy), id: s.id});
+                                if (available.length >= 5) break;
                             }
-                            // 2. Cursor-pointer elements (zones/sections)
-                            const pointerEls = [];
-                            for (const el of document.querySelectorAll('*')) {
-                                if (window.getComputedStyle(el).cursor !== 'pointer') continue;
-                                const r = el.getBoundingClientRect();
-                                if (r.width < 10) continue;
-                                const tag = el.tagName.toLowerCase();
-                                if (tag === 'button') continue; // skip buttons, already handled
-                                const text = (el.textContent||'').trim().substring(0, 30);
-                                pointerEls.push({tag, cls: (el.className||'').toString().substring(0,40), text, x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2), w: Math.round(r.width)});
-                            }
-                            // 3. Seat map <img> position
-                            const img = document.querySelector('img[src*="ticketimage"]');
-                            const imgRect = img ? img.getBoundingClientRect() : null;
-                            return JSON.stringify({
-                                svgClickable: svgClickable.slice(0, 5),
-                                pointerEls: pointerEls.slice(0, 10),
-                                seatImg: imgRect ? {x: Math.round(imgRect.left+imgRect.width/2), y: Math.round(imgRect.top+imgRect.height/2), w: Math.round(imgRect.width), h: Math.round(imgRect.height), src: img.src.substring(img.src.lastIndexOf('/')+1, img.src.lastIndexOf('/')+30)} : null
-                            });
+                            return JSON.stringify({total, available});
                         })()
-                    ''')
-                    print(f"[NOL] Post-grade zone scan: {zone_scan}")
+                    '''
 
-                    # Try CDP physical click on seat map image or clickable zone
+                    # Check if circles already visible (rare, but possible)
+                    circ0 = await tab.evaluate(_seat_circle_js)
+                    print(f"[NOL] Seat circles (before zone click): {circ0}")
+                    circle_data = {}
                     try:
-                        zd = json.loads(zone_scan)
-                        click_x, click_y = None, None
-                        if zd.get('svgClickable'):
-                            click_x = zd['svgClickable'][0]['x']
-                            click_y = zd['svgClickable'][0]['y']
-                            print(f"[NOL] CDP: clicking SVG zone at ({click_x},{click_y})")
-                        elif zd.get('seatImg'):
-                            click_x = zd['seatImg']['x']
-                            click_y = zd['seatImg']['y']
-                            print(f"[NOL] CDP: clicking seat map image center at ({click_x},{click_y})")
-                        if click_x and click_y:
-                            await tab.send(cdp.input_.dispatch_mouse_event(
-                                type_='mousePressed', x=float(click_x), y=float(click_y),
-                                button=cdp.input_.MouseButton.LEFT, click_count=1))
-                            await asyncio.sleep(0.1)
-                            await tab.send(cdp.input_.dispatch_mouse_event(
-                                type_='mouseReleased', x=float(click_x), y=float(click_y),
-                                button=cdp.input_.MouseButton.LEFT, click_count=1))
-                            await asyncio.sleep(1.5)
-                            # Check URL again after CDP click
-                            url_cdp = await tab.evaluate('location.href')
-                            print(f"[NOL] URL after CDP click: {url_cdp}")
-                            if url_cdp != url_after:
-                                print(f"[NOL] ⚡ Page navigated after CDP click → {url_cdp}")
-                                return True
-                    except Exception as e:
-                        print(f"[NOL] CDP zone click error: {e}")
+                        circle_data = json.loads(circ0)
+                    except Exception:
+                        pass
 
-                    print("[NOL] Grade selected, falling through to order confirm...")
-                    seat_result = grade_result
+                    # Step C: CDP-click seat map image at multiple positions to enter seat view
+                    if circle_data.get('total', 0) <= 1:
+                        img_info_raw = await tab.evaluate('''
+                            (function() {
+                                const img = document.querySelector('img[src*="ticketimage"]');
+                                if (!img) return null;
+                                const r = img.getBoundingClientRect();
+                                return JSON.stringify({left: r.left, top: r.top, w: r.width, h: r.height});
+                            })()
+                        ''')
+                        if img_info_raw:
+                            try:
+                                idata = json.loads(img_info_raw)
+                                click_positions = [
+                                    (0.50, 0.50, 'center'),
+                                    (0.35, 0.45, 'center-left'),
+                                    (0.65, 0.45, 'center-right'),
+                                    (0.35, 0.65, 'lower-left'),
+                                    (0.65, 0.65, 'lower-right'),
+                                    (0.50, 0.30, 'upper-center'),
+                                    (0.25, 0.55, 'far-left'),
+                                    (0.75, 0.55, 'far-right'),
+                                ]
+                                for px, py, pos_name in click_positions:
+                                    cx = idata['left'] + idata['w'] * px
+                                    cy = idata['top']  + idata['h'] * py
+                                    print(f"[NOL] CDP zone click: {pos_name} ({cx:.0f},{cy:.0f})")
+                                    await tab.send(cdp.input_.dispatch_mouse_event(
+                                        type_='mousePressed', x=cx, y=cy,
+                                        button=cdp.input_.MouseButton.LEFT, click_count=1))
+                                    await asyncio.sleep(0.08)
+                                    await tab.send(cdp.input_.dispatch_mouse_event(
+                                        type_='mouseReleased', x=cx, y=cy,
+                                        button=cdp.input_.MouseButton.LEFT, click_count=1))
+                                    await asyncio.sleep(1.8)
+                                    # Check if circles loaded
+                                    circ_n = await tab.evaluate(_seat_circle_js)
+                                    print(f"[NOL] Circles after {pos_name}: {circ_n}")
+                                    try:
+                                        circle_data = json.loads(circ_n)
+                                    except Exception:
+                                        pass
+                                    if circle_data.get('total', 0) > 1:
+                                        break  # circles appeared, exit loop
+                            except Exception as e:
+                                print(f"[NOL] CDP zone click error: {e}")
+
+                    # Step D: click an available seat circle via CDP
+                    if circle_data.get('available') and len(circle_data['available']) > 0:
+                        seat_info = circle_data['available'][0]
+                        sx, sy = float(seat_info['x']), float(seat_info['y'])
+                        print(f"[NOL] CDP: clicking seat circle at ({sx:.0f},{sy:.0f}) id={seat_info.get('id','')}")
+                        await tab.send(cdp.input_.dispatch_mouse_event(
+                            type_='mousePressed', x=sx, y=sy,
+                            button=cdp.input_.MouseButton.LEFT, click_count=1))
+                        await asyncio.sleep(0.08)
+                        await tab.send(cdp.input_.dispatch_mouse_event(
+                            type_='mouseReleased', x=sx, y=sy,
+                            button=cdp.input_.MouseButton.LEFT, click_count=1))
+                        await asyncio.sleep(1.2)
+                        seat_result = f"cdp_seat_click: {seat_info.get('id', '')}"
+                        print(f"[NOL] ✅ Seat circle clicked: {seat_result}")
+                    elif circle_data.get('total', 0) > 1:
+                        print(f"[NOL] ⚠️ {circle_data['total']} seat circles found but all sold out in this zone")
+                        return True  # retry next iteration
+                    else:
+                        # No circles at all — fallback: treat grade selection as seat selection
+                        print("[NOL] No seat circles found, falling through with grade-only selection...")
+                        seat_result = grade_result
 
         # Wait for seat selection to register
         await asyncio.sleep(1.0)
