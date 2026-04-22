@@ -2104,19 +2104,15 @@ def launch_maxbot(script_name="nodriver_tixcraft", filename="", homepage="", kkt
         subprocess.Popen(cmd, shell=True, cwd=working_dir)
     else:
         interpreter_binary = sys.executable
-        print("execute in shell mode.", flush=True)
+        print("execute in shell mode.")
 
         try:
-            print('try', interpreter_binary, flush=True)
-            cmd_array = [interpreter_binary, '-u', script_name + '.py'] + cmd_argument
-            env = os.environ.copy()
-            env['PYTHONUNBUFFERED'] = '1'
-            # Inherit parent's stdout/stderr so output appears directly in the terminal
-            s = subprocess.Popen(cmd_array, cwd=working_dir, env=env)
-            print(f'[BOT] Process started, PID={s.pid}', flush=True)
+            print('try', interpreter_binary)
+            cmd_array = [interpreter_binary, script_name + '.py'] + cmd_argument
+            s=subprocess.Popen(cmd_array, cwd=working_dir)
         except Exception as exc:
             msg=str(exc)
-            print("exeption:", msg, flush=True)
+            print("exeption:", msg)
             pass
 
 def parse_nodriver_result(result):

@@ -476,8 +476,7 @@ class ResumeHandler(tornado.web.RequestHandler):
 
 class RunHandler(tornado.web.RequestHandler):
     def get(self):
-        import sys
-        print('run button pressed.', flush=True)
+        print('run button pressed.')
         launch_maxbot()
         self.write({"run": True})
 
