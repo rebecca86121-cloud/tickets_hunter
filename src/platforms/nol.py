@@ -2619,14 +2619,78 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                         print(f"[NOL] URL after grade wait: {url_after}")
                         if url_after != url_before:
                             print(f"[NOL] ⚡ Page navigated after grade click → {url_after}")
-                            # Page moved — let main loop handle the new URL
                             return True
                     except Exception:
                         pass
-                    # Still on seat page — treat grade selection as seat selection,
-                    # fall through to _nol_click_next_step which clicks "訂購確認 / 取消"
+
+                    # Scan for interactive zone elements that appeared after grade selection
+                    zone_scan = await tab.evaluate('''
+                        (function() {
+                            // 1. SVG clickable paths/zones
+                            const svgClickable = [];
+                            for (const el of document.querySelectorAll('svg path, svg polygon, svg circle[r!="1"], svg rect, svg g')) {
+                                const style = window.getComputedStyle(el);
+                                if (style.pointerEvents === 'none') continue;
+                                const r = el.getBoundingClientRect();
+                                if (r.width < 5) continue;
+                                svgClickable.push({tag: el.tagName, cls: (el.className.baseVal||'').substring(0,40),
+                                    x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2), w: Math.round(r.width)});
+                            }
+                            // 2. Cursor-pointer elements (zones/sections)
+                            const pointerEls = [];
+                            for (const el of document.querySelectorAll('*')) {
+                                if (window.getComputedStyle(el).cursor !== 'pointer') continue;
+                                const r = el.getBoundingClientRect();
+                                if (r.width < 10) continue;
+                                const tag = el.tagName.toLowerCase();
+                                if (tag === 'button') continue; // skip buttons, already handled
+                                const text = (el.textContent||'').trim().substring(0, 30);
+                                pointerEls.push({tag, cls: (el.className||'').toString().substring(0,40), text, x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2), w: Math.round(r.width)});
+                            }
+                            // 3. Seat map <img> position
+                            const img = document.querySelector('img[src*="ticketimage"]');
+                            const imgRect = img ? img.getBoundingClientRect() : null;
+                            return JSON.stringify({
+                                svgClickable: svgClickable.slice(0, 5),
+                                pointerEls: pointerEls.slice(0, 10),
+                                seatImg: imgRect ? {x: Math.round(imgRect.left+imgRect.width/2), y: Math.round(imgRect.top+imgRect.height/2), w: Math.round(imgRect.width), h: Math.round(imgRect.height), src: img.src.substring(img.src.lastIndexOf('/')+1, img.src.lastIndexOf('/')+30)} : null
+                            });
+                        })()
+                    ''')
+                    print(f"[NOL] Post-grade zone scan: {zone_scan}")
+
+                    # Try CDP physical click on seat map image or clickable zone
+                    try:
+                        zd = json.loads(zone_scan)
+                        click_x, click_y = None, None
+                        if zd.get('svgClickable'):
+                            click_x = zd['svgClickable'][0]['x']
+                            click_y = zd['svgClickable'][0]['y']
+                            print(f"[NOL] CDP: clicking SVG zone at ({click_x},{click_y})")
+                        elif zd.get('seatImg'):
+                            click_x = zd['seatImg']['x']
+                            click_y = zd['seatImg']['y']
+                            print(f"[NOL] CDP: clicking seat map image center at ({click_x},{click_y})")
+                        if click_x and click_y:
+                            await tab.send(cdp.input_.dispatch_mouse_event(
+                                type_='mousePressed', x=float(click_x), y=float(click_y),
+                                button=cdp.input_.MouseButton.LEFT, click_count=1))
+                            await asyncio.sleep(0.1)
+                            await tab.send(cdp.input_.dispatch_mouse_event(
+                                type_='mouseReleased', x=float(click_x), y=float(click_y),
+                                button=cdp.input_.MouseButton.LEFT, click_count=1))
+                            await asyncio.sleep(1.5)
+                            # Check URL again after CDP click
+                            url_cdp = await tab.evaluate('location.href')
+                            print(f"[NOL] URL after CDP click: {url_cdp}")
+                            if url_cdp != url_after:
+                                print(f"[NOL] ⚡ Page navigated after CDP click → {url_cdp}")
+                                return True
+                    except Exception as e:
+                        print(f"[NOL] CDP zone click error: {e}")
+
                     print("[NOL] Grade selected, falling through to order confirm...")
-                    seat_result = grade_result  # contains 'clicked_grade_colored: ...'
+                    seat_result = grade_result
 
         # Wait for seat selection to register
         await asyncio.sleep(1.0)
