@@ -2613,7 +2613,7 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                         print(f"[NOL] URL before grade wait: {url_before}")
                     except Exception:
                         url_before = ''
-                    await asyncio.sleep(2.5)
+                    await asyncio.sleep(2.0)
                     try:
                         url_after = await tab.evaluate('location.href')
                         print(f"[NOL] URL after grade wait: {url_after}")
@@ -2623,27 +2623,10 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
                             return True
                     except Exception:
                         pass
-                    # Still on seat page — look for a confirm/payment button that appeared
-                    confirm_btn = await tab.evaluate('''
-                        (function() {
-                            const keywords = ['완료', '결제', '구매', '확인', '다음', 'next', '付款',
-                                              '確認', '下一步', 'Next', 'proceed', 'payment', 'buy'];
-                            const btns = document.querySelectorAll('button, a[role="button"]');
-                            for (const btn of btns) {
-                                const text = (btn.textContent || '').trim();
-                                if (!text) continue;
-                                for (const kw of keywords) {
-                                    if (text.includes(kw)) {
-                                        btn.click();
-                                        return 'clicked_confirm: ' + text.substring(0, 40);
-                                    }
-                                }
-                            }
-                            return 'no_confirm_btn';
-                        })()
-                    ''')
-                    print(f"[NOL] Post-grade confirm: {confirm_btn}")
-                    return True
+                    # Still on seat page — treat grade selection as seat selection,
+                    # fall through to _nol_click_next_step which clicks "訂購確認 / 取消"
+                    print("[NOL] Grade selected, falling through to order confirm...")
+                    seat_result = grade_result  # contains 'clicked_grade_colored: ...'
 
         # Wait for seat selection to register
         await asyncio.sleep(1.0)
@@ -2687,17 +2670,21 @@ async def _nol_handle_onestop_seat(tab, url, config_dict):
             # Wait for confirmation dialog to appear
             await asyncio.sleep(1.0)
 
-            # Handle confirmation dialog: "確定要移動至訂購確認 / 取消嗎？"
+            # Handle confirmation dialog: "確定要移動至訂購確認 / 取消嗎？" or Korean variant
             try:
                 for attempt in range(5):
                     dialog_result = await tab.evaluate('''
                         (function() {
                             const bodyText = document.body ? (document.body.innerText || '') : '';
-                            if (bodyText.includes('確定要移動至訂購確認') || bodyText.includes('移動時會失去現在的訂購')) {
+                            const hasConfirmDialog = bodyText.includes('確定要移動至訂購確認') ||
+                                bodyText.includes('移動時會失去現在的訂購') ||
+                                bodyText.includes('주문 확인') ||
+                                bodyText.includes('이동하시겠습니까');
+                            if (hasConfirmDialog) {
                                 const btns = document.querySelectorAll('button');
                                 for (const btn of btns) {
                                     const text = btn.textContent.trim();
-                                    if (text === '確認' || text === '确认') {
+                                    if (text === '確認' || text === '确认' || text === '확인' || text === '이동') {
                                         btn.click();
                                         return 'confirmed: ' + text;
                                     }
